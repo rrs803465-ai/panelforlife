@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}VPS — Panel4Life{% endblock %}
+{% block body %}
+<script>
+  // vps_view.html just redirects to dashboard with the vps selected
+  window.location.replace("{{ url_for('dashboard', vps_id=vps.id) }}");
+</script>
+<noscript><a href="{{ url_for('dashboard', vps_id=vps.id) }}">Go to dashboard</a></noscript>
+{% endblock %}

@@ -1,0 +1,285 @@
+{% extends "base.html" %}
+{% block title %}Panel4Life — Free Cloud VPS{% endblock %}
+{% block head %}
+<style>
+  body { background: var(--bg); }
+
+  /* ── Hero ─────────────────────────────────────────────────────── */
+  .hero {
+    min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 4rem 2rem;
+    position: relative; overflow: hidden;
+  }
+  .hero-grid {
+    position: absolute; inset: 0; pointer-events: none;
+    background-image:
+      linear-gradient(rgba(63,185,80,.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(63,185,80,.05) 1px, transparent 1px);
+    background-size: 40px 40px;
+    mask-image: radial-gradient(ellipse 80% 60% at 50% 40%, black 30%, transparent 100%);
+  }
+  .hero-glow {
+    position: absolute; top: 20%; left: 50%; transform: translateX(-50%);
+    width: 600px; height: 300px;
+    background: radial-gradient(ellipse, rgba(63,185,80,.08) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .hero-inner { position: relative; z-index: 1; text-align: center; max-width: 680px; }
+  .hero-badge {
+    display: inline-flex; align-items: center; gap: .5rem;
+    padding: .3rem .9rem;
+    border: 1px solid rgba(63,185,80,.3);
+    border-radius: 99px;
+    font-family: var(--mono); font-size: .72rem;
+    color: var(--accent); background: rgba(63,185,80,.06);
+    margin-bottom: 2rem;
+  }
+  .hero-badge .pulse {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent);
+    animation: pulse 2s ease infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(.8)} }
+  .hero h1 {
+    font-size: clamp(2.4rem, 6vw, 4rem);
+    font-weight: 600; letter-spacing: -.04em;
+    color: var(--text); line-height: 1.1;
+    margin-bottom: 1.25rem;
+  }
+  .hero h1 span { color: var(--accent); }
+  .hero-sub {
+    font-size: 1.05rem; color: var(--text-2);
+    max-width: 520px; margin: 0 auto 2.5rem;
+    line-height: 1.65;
+  }
+  .hero-cta {
+    display: flex; gap: .75rem; justify-content: center; flex-wrap: wrap;
+  }
+  .btn-hero {
+    padding: .7rem 1.75rem; font-size: .95rem; font-weight: 600;
+    border-radius: var(--radius); border: 1px solid transparent;
+    cursor: pointer; transition: all .15s;
+    text-decoration: none; display: inline-flex; align-items: center; gap: .4rem;
+  }
+  .btn-hero-primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .btn-hero-primary:hover { background: var(--accent-hi); border-color: var(--accent-hi); color: var(--bg); }
+  .btn-hero-ghost { background: transparent; color: var(--text-2); border-color: var(--border); }
+  .btn-hero-ghost:hover { background: var(--bg-2); color: var(--text); border-color: var(--border-hi); }
+
+  /* ── Specs strip ─────────────────────────────────────────────── */
+  .specs-strip {
+    display: flex; justify-content: center; gap: 0;
+    margin-top: 4rem; border: 1px solid var(--border);
+    border-radius: var(--radius-lg); overflow: hidden;
+    background: var(--bg-1);
+  }
+  .spec-item {
+    flex: 1; padding: 1.25rem 1.5rem; text-align: center;
+    border-right: 1px solid var(--border);
+  }
+  .spec-item:last-child { border-right: none; }
+  .spec-num { font-family: var(--mono); font-size: 1.4rem; font-weight: 600; color: var(--accent); }
+  .spec-lbl { font-size: .72rem; color: var(--text-3); margin-top: .2rem; }
+
+  /* ── Features grid ───────────────────────────────────────────── */
+  .features {
+    max-width: 1000px; margin: 6rem auto 0;
+    padding: 0 2rem;
+  }
+  .features-head {
+    text-align: center; margin-bottom: 3rem;
+  }
+  .features-head h2 { font-size: 1.6rem; font-weight: 600; letter-spacing: -.03em; }
+  .features-head p { color: var(--text-2); margin-top: .4rem; font-size: .9rem; }
+  .feat-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px;
+    background: var(--border); border-radius: var(--radius-lg); overflow: hidden;
+  }
+  .feat-card {
+    background: var(--bg-1); padding: 1.75rem 1.5rem;
+  }
+  .feat-icon { font-size: 1.5rem; margin-bottom: 1rem; }
+  .feat-card h3 { font-size: .9rem; font-weight: 600; color: var(--text); margin-bottom: .4rem; }
+  .feat-card p { font-size: .8rem; color: var(--text-2); line-height: 1.55; }
+
+  /* ── How it works ─────────────────────────────────────────────── */
+  .how {
+    max-width: 700px; margin: 6rem auto 0; padding: 0 2rem;
+    text-align: center;
+  }
+  .how h2 { font-size: 1.4rem; font-weight: 600; letter-spacing: -.03em; margin-bottom: 2.5rem; }
+  .steps { display: flex; flex-direction: column; gap: 0; }
+  .step {
+    display: flex; gap: 1.25rem; align-items: flex-start;
+    padding: 1.25rem 0; border-bottom: 1px solid var(--border);
+    text-align: left;
+  }
+  .step:last-child { border-bottom: none; }
+  .step-num {
+    width: 32px; height: 32px; border-radius: 50%;
+    background: var(--bg-2); border: 1px solid var(--border);
+    font-family: var(--mono); font-size: .78rem; color: var(--accent);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .step-body h4 { font-size: .88rem; font-weight: 600; margin-bottom: .25rem; }
+  .step-body p  { font-size: .8rem; color: var(--text-2); }
+
+  /* ── Footer ───────────────────────────────────────────────────── */
+  .landing-footer {
+    text-align: center; padding: 4rem 2rem 2rem;
+    color: var(--text-3); font-size: .78rem;
+    border-top: 1px solid var(--border); margin-top: 6rem;
+  }
+  .landing-footer a { color: var(--text-3); }
+  .landing-footer a:hover { color: var(--text-2); }
+
+  /* ── Landing nav ─────────────────────────────────────────────── */
+  .landing-nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 2rem; height: 56px;
+    background: rgba(8,11,16,.8); backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+  .landing-nav .brand { font-family: var(--mono); font-size: .9rem; font-weight: 600; color: var(--text); }
+  .landing-nav .brand span { color: var(--accent); }
+  .landing-nav-links { display: flex; gap: .5rem; align-items: center; }
+  .landing-nav-links a {
+    font-size: .82rem; color: var(--text-2); padding: .35rem .7rem;
+    border-radius: var(--radius); transition: all .15s;
+  }
+  .landing-nav-links a:hover { color: var(--text); background: var(--bg-2); }
+  .landing-nav-links .nav-cta {
+    background: var(--accent); color: var(--bg); font-weight: 600; padding: .35rem .85rem;
+  }
+  .landing-nav-links .nav-cta:hover { background: var(--accent-hi); color: var(--bg); }
+
+  @media (max-width: 768px) {
+    .feat-grid { grid-template-columns: 1fr; }
+    .specs-strip { flex-direction: column; }
+    .spec-item { border-right: none; border-bottom: 1px solid var(--border); }
+    .spec-item:last-child { border-bottom: none; }
+    .hero h1 { font-size: 2.2rem; }
+  }
+</style>
+{% endblock %}
+{% block body %}
+<nav class="landing-nav">
+  <div class="brand">Panel<span>4</span>Life</div>
+  <div class="landing-nav-links">
+    <a href="{{ url_for('login') }}">Sign in</a>
+    <a href="{{ url_for('register') }}" class="nav-cta">Get started</a>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="hero-grid"></div>
+  <div class="hero-glow"></div>
+  <div class="hero-inner">
+    <div class="hero-badge">
+      <span class="pulse"></span>
+      Free VPS Hosting — No credit card
+    </div>
+    <h1>Your server,<br><span>live in minutes.</span></h1>
+    <p class="hero-sub">
+      Full Ubuntu 22.04 LXC containers with terminal access, file manager,
+      and SSH — provisioned automatically, managed from a single panel.
+    </p>
+    <div class="hero-cta">
+      <a href="{{ url_for('register') }}" class="btn-hero btn-hero-primary">Create free VPS</a>
+      <a href="{{ url_for('login') }}" class="btn-hero btn-hero-ghost">Sign in →</a>
+    </div>
+
+    <div class="specs-strip">
+      <div class="spec-item">
+        <div class="spec-num">Ubuntu</div>
+        <div class="spec-lbl">22.04 LTS</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-num">LXC</div>
+        <div class="spec-lbl">Container</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-num">SSH</div>
+        <div class="spec-lbl">+ Browser terminal</div>
+      </div>
+      <div class="spec-item">
+        <div class="spec-num">Multi</div>
+        <div class="spec-lbl">Node mesh</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="features">
+  <div class="features-head">
+    <h2>Everything you need to run your projects</h2>
+    <p>No configuration. No waiting. One click and your container is live.</p>
+  </div>
+  <div class="feat-grid">
+    <div class="feat-card">
+      <div class="feat-icon">🖥️</div>
+      <h3>Browser Terminal</h3>
+      <p>Full bash shell in your browser via sshx. No client install needed. Copy-paste works.</p>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">📁</div>
+      <h3>File Manager</h3>
+      <p>Upload, download, create folders and delete files inside your container directly from the panel.</p>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">📊</div>
+      <h3>Live Stats</h3>
+      <p>Real-time CPU and memory usage per VPS, updated every 5 seconds. Know what's running.</p>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">🔗</div>
+      <h3>Multi-Node Mesh</h3>
+      <p>Nodes link automatically. When one is full, new VPSes overflow to the next node seamlessly.</p>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">🛡️</div>
+      <h3>Mining Detection</h3>
+      <p>Background monitor detects crypto miners and suspends them automatically. Fair use for everyone.</p>
+    </div>
+    <div class="feat-card">
+      <div class="feat-icon">⚡</div>
+      <h3>Instant Reinstall</h3>
+      <p>One click wipes your container and provisions a fresh Ubuntu 22.04 instance. Data is gone, speed is back.</p>
+    </div>
+  </div>
+</section>
+
+<section class="how">
+  <h2>Up and running in three steps</h2>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>Create an account</h4>
+        <p>Pick a username and password. No email, no verification, no waiting.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>Click "Create VPS"</h4>
+        <p>Your container is queued and provisioned. Usually ready in under two minutes.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>Connect via browser or SSH</h4>
+        <p>Open the embedded terminal or copy the sshx link. Root access from the first login.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="landing-footer">
+  Panel4Life &mdash; <a href="{{ url_for('register') }}">Get started</a> &middot; <a href="{{ url_for('login') }}">Sign in</a>
+</footer>
+{% endblock %}

@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Files — {{ vps.container_id[:16] }}{% endblock %}
+{% block head %}
+<style>
+.fm-header { display:flex; align-items:center; gap:.75rem; margin-bottom:1.25rem; flex-wrap:wrap; }
+.breadcrumb { display:flex; align-items:center; gap:.25rem; font-family:var(--mono); font-size:.8rem; flex-wrap:wrap; }
+.breadcrumb a { color:var(--accent); }
+.breadcrumb span { color:var(--text-3); }
+.fm-list { background:var(--bg-1); border:1px solid var(--border); border-radius:var(--radius-lg); overflow:hidden; }
+.fm-toolbar {
+  display:flex; align-items:center; gap:.75rem; flex-wrap:wrap;
+  padding:.75rem 1rem; border-bottom:1px solid var(--border);
+  background:var(--bg-2);
+}
+.fm-row { display:flex; align-items:center; gap:.75rem; padding:.5rem 1rem; border-bottom:1px solid var(--border); transition:background .1s; }
+.fm-row:last-child { border-bottom:none; }
+.fm-row:hover { background:var(--bg-2); }
+.fm-icon { font-size:.95rem; width:22px; text-align:center; flex-shrink:0; }
+.fm-name { flex:1; font-family:var(--mono); font-size:.82rem; color:var(--text); word-break:break-all; }
+.fm-name a { color:var(--text); text-decoration:none; }
+.fm-name a:hover { color:var(--accent); }
+.fm-size { font-family:var(--mono); font-size:.7rem; color:var(--text-3); min-width:65px; text-align:right; }
+.fm-acts { display:flex; gap:.3rem; }
+</style>
+{% endblock %}
+{% block body %}
+<div class="page">
+  <div class="fm-header">
+    <div>
+      <a href="{{ url_for('dashboard', vps_id=vps.id) }}" class="btn btn-ghost btn-sm">← Back to VPS</a>
+    </div>
+    <div>
+      <h2 style="font-size:.95rem;font-weight:600;">File Manager</h2>
+      <div style="font-size:.75rem;color:var(--text-3);font-family:var(--mono);">{{ vps.container_id[:20] }}</div>
+    </div>
+    <div class="breadcrumb">
+      {% set parts = path.split('/') %}
+      {% set acc = '' %}
+      {% for part in parts %}
+        {% if part %}
+          {% set acc = acc + '/' + part %}
+          <span>/</span><a href="{{ url_for('file_manager', vps_id=vps.id, path=acc) }}">{{ part }}</a>
+        {% else %}
+          <a href="{{ url_for('file_manager', vps_id=vps.id, path='/') }}">root</a>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="fm-list">
+    <!-- Toolbar: upload + mkdir -->
+    <div class="fm-toolbar">
+      <form method="post" action="{{ url_for('file_upload', vps_id=vps.id) }}" enctype="multipart/form-data" style="display:flex;align-items:center;gap:.5rem;">
+        <input type="hidden" name="path" value="{{ path }}">
+        <input type="file" name="file" id="fileInput" style="display:none;" onchange="this.form.submit()">
+        <button type="button" class="btn btn-primary btn-sm" onclick="document.getElementById('fileInput').click()">↑ Upload</button>
+      </form>
+      <form method="post" action="{{ url_for('file_mkdir', vps_id=vps.id) }}" style="display:flex;align-items:center;gap:.5rem;">
+        <input type="hidden" name="base" value="{{ path }}">
+        <input name="name" class="form-input" placeholder="New folder name" style="height:30px;padding:.25rem .6rem;font-size:.78rem;width:160px;">
+        <button type="submit" class="btn btn-ghost btn-sm">+ Folder</button>
+      </form>
+      <!-- Parent dir -->
+      {% if path != '/' %}
+      {% set parent = path.rsplit('/',1)[0] or '/' %}
+      <a href="{{ url_for('file_manager', vps_id=vps.id, path=parent) }}" class="btn btn-ghost btn-sm">↑ Up</a>
+      {% endif %}
+    </div>
+
+    {% if entries %}
+    {% for e in entries | sort(attribute='type') | sort(attribute='name') %}
+    <div class="fm-row">
+      <span class="fm-icon">{{ '📁' if e.type == 'dir' else '🔗' if e.type == 'link' else '📄' }}</span>
+      <span class="fm-name">
+        {% if e.type == 'dir' %}
+        <a href="{{ url_for('file_manager', vps_id=vps.id, path=path.rstrip('/')+'/'+e.name) }}">{{ e.name }}/</a>
+        {% else %}
+        {{ e.name }}
+        {% endif %}
+      </span>
+      <span class="fm-size">
+        {% if e.size %}
+          {% if e.size > 1048576 %}{{ (e.size/1048576)|round(1) }}MB
+          {% elif e.size > 1024 %}{{ (e.size/1024)|round(1) }}KB
+          {% else %}{{ e.size }}B{% endif %}
+        {% endif %}
+      </span>
+      <div class="fm-acts">
+        {% if e.type != 'dir' %}
+        <a href="{{ url_for('file_download', vps_id=vps.id, path=path.rstrip('/')+'/'+e.name) }}" class="btn btn-ghost btn-sm">↓</a>
+        {% endif %}
+        <form method="post" action="{{ url_for('file_delete', vps_id=vps.id) }}"
+              onsubmit="return confirm('Delete {{ e.name }}?')">
+          <input type="hidden" name="path" value="{{ path.rstrip('/')+'/'+e.name }}">
+          <input type="hidden" name="back" value="{{ path }}">
+          <button class="btn btn-danger btn-sm">✕</button>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+    {% else %}
+    <div class="empty">
+      <div class="empty-icon">📂</div>
+      <div>This directory is empty.</div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

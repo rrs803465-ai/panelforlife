@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Delete Account — Panel4Life{% endblock %}
+{% block body %}
+<div class="page-sm" style="padding-top:3rem;">
+  {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+  <div class="card">
+    <div style="text-align:center;margin-bottom:1.5rem;">
+      <div style="font-size:1.8rem;margin-bottom:.5rem;">⚠️</div>
+      <h2 style="font-size:1rem;font-weight:600;">Delete your account</h2>
+      <p style="font-size:.82rem;color:var(--text-2);margin-top:.4rem;">All your VPS containers will be permanently destroyed. This cannot be undone.</p>
+    </div>
+    <form method="post">
+      <div class="form-group">
+        <label class="form-label">Enter your recovery code to confirm</label>
+        <input name="code" class="form-input" placeholder="XXXXXX" style="text-transform:uppercase;letter-spacing:.1em;font-family:var(--mono);">
+      </div>
+      <button type="submit" class="btn btn-danger btn-full">Delete my account permanently</button>
+    </form>
+  </div>
+  <div style="text-align:center;margin-top:1rem;font-size:.8rem;">
+    <a href="{{ url_for('dashboard') }}" style="color:var(--text-2);">Cancel</a>
+  </div>
+</div>
+{% endblock %}

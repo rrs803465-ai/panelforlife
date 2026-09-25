@@ -1,0 +1,480 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Panel4Life{% endblock %}
+{% block head %}
+<style>
+/* SVG icons used inline below — stroke: currentColor */
+.dash { display: grid; grid-template-columns: 248px 1fr; gap: 1.1rem; }
+.sidebar { display: flex; flex-direction: column; gap: .65rem; }
+
+.vps-item {
+  display: flex; align-items: center; gap: .55rem;
+  padding: .42rem .6rem; border-radius: var(--r);
+  border: 1px solid transparent; font-size: .76rem;
+  color: var(--text-2); transition: all .12s;
+  cursor: pointer; text-decoration: none;
+}
+.vps-item:hover { background: var(--bg-2); color: var(--text); border-color: var(--border); }
+.vps-item.active { background: var(--bg-2); border-color: var(--border-hi); color: var(--text); }
+.vps-item-name { flex: 1; font-family: var(--mono); font-size: .72rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vps-item-st   { font-size: .62rem; color: var(--text-3); white-space: nowrap; }
+
+.main { display: flex; flex-direction: column; gap: .9rem; min-width: 0; }
+.stats-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: .7rem; }
+
+.tabs { display: flex; border-bottom: 1px solid var(--border); }
+.tab  { display: flex; align-items: center; gap: .3rem; padding: .42rem .8rem; font-size: .74rem; color: var(--text-3); cursor: pointer; border-bottom: 2px solid transparent; transition: all .12s; user-select: none; }
+.tab:hover { color: var(--text-2); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.info-grid  { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+.info-item  { display: flex; flex-direction: column; gap: .12rem; }
+.info-label { font-size: .61rem; font-family: var(--mono); color: var(--text-3); text-transform: uppercase; letter-spacing: .08em; display: flex; align-items: center; gap: .3rem; }
+.info-val   { font-size: .78rem; font-family: var(--mono); color: var(--text); word-break: break-all; }
+
+.action-row { display: flex; gap: .38rem; flex-wrap: wrap; }
+
+.queue-card { background: var(--bg-1); border: 1px solid rgba(64,136,240,.22); border-radius: var(--r-xl); padding: 1.5rem; text-align: center; }
+.queue-ring { width: 44px; height: 44px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--blue); animation: spin .9s linear infinite; margin: 0 auto .9rem; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.stars-input { display: flex; gap: .18rem; }
+.star-btn { background: none; border: none; cursor: pointer; color: var(--text-3); transition: color .1s, transform .1s; padding: 0; line-height: 1; }
+.star-btn svg { display: block; }
+.star-btn:hover { transform: scale(1.1); }
+.star-btn.lit svg { fill: var(--warn); stroke: var(--warn); }
+
+.review-item { padding: .46rem 0; border-bottom: 1px solid var(--border); }
+.review-item:last-child { border-bottom: none; }
+.review-stars { display: flex; gap: .1rem; }
+.review-text  { font-size: .72rem; color: var(--text-2); margin-top: .12rem; }
+.review-user  { font-size: .63rem; color: var(--text-3); font-family: var(--mono); }
+
+@media (max-width: 900px) { .dash { grid-template-columns: 1fr; } .stats-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 480px) { .stats-grid { grid-template-columns: 1fr; } .info-grid { grid-template-columns: 1fr; } }
+</style>
+{% endblock %}
+{% block body %}
+<div class="page">
+<div class="dash">
+
+<!-- ── Sidebar ── -->
+<aside class="sidebar">
+  <div class="card card-sm">
+    <div style="display:flex;align-items:center;gap:.55rem;margin-bottom:.65rem;">
+      <div style="width:26px;height:26px;border-radius:50%;background:var(--bg-3);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:.75rem;color:var(--text-2);">
+        {{ current_user.username[0].upper() }}
+      </div>
+      <div>
+        <div style="font-size:.78rem;font-weight:500;color:var(--text);">{{ current_user.username }}</div>
+        {% if current_user.youtube_verified %}<span class="badge badge-purple">verified</span>{% endif %}
+      </div>
+    </div>
+    <a href="{{ url_for('delete_account') }}" style="font-size:.68rem;color:var(--text-3);display:flex;align-items:center;gap:.3rem;">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><polyline points="3 6 3 14 13 14 13 6"/><line x1="1" y1="4" x2="15" y2="4"/><path d="M6 4V2h4v2"/></svg>
+      Delete account
+    </a>
+  </div>
+
+  <div class="card card-sm">
+    <div class="card-title">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="1" y="3" width="14" height="10" rx="2"/><line x1="5" y1="7" x2="11" y2="7"/><line x1="5" y1="10" x2="9" y2="10"/></svg>
+      Servers
+    </div>
+    {% if all_vps %}
+    <div style="display:flex;flex-direction:column;gap:.18rem;">
+      {% for v in all_vps %}
+      <a href="{{ url_for('dashboard', vps_id=v.id) }}"
+         class="vps-item {{ 'active' if vps and vps.id == v.id }}">
+        <span class="dot {{ 'dot-green' if v.status=='running' else 'dot-yellow' if v.status in ('creating','queued') else 'dot-red' if v.status in ('failed','suspended') else 'dot-grey' }}"></span>
+        <span class="vps-item-name">{{ v.container_id[:16] if v.container_id not in ('pending','pending-overflow') else 'provisioning...' }}</span>
+        <span class="vps-item-st">{{ v.status }}</span>
+      </a>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% if not all_vps %}
+    <form method="post" action="{{ url_for('vps_create') }}" style="margin-top:.3rem;">
+      <button class="btn btn-primary btn-full btn-sm">
+        <svg class="icon icon-sm" viewBox="0 0 16 16"><line x1="8" y1="2" x2="8" y2="14"/><line x1="2" y1="8" x2="14" y2="8"/></svg>
+        Create VPS
+      </button>
+    </form>
+    {% endif %}
+  </div>
+
+  {% if limits %}
+  <div class="card card-sm">
+    <div class="card-title">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="2" y="4" width="12" height="8" rx="1.5"/><line x1="5" y1="4" x2="5" y2="12"/><line x1="11" y1="4" x2="11" y2="12"/></svg>
+      Free tier
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.32rem;font-size:.72rem;font-family:var(--mono);">
+      <div class="flex-b">
+        <span style="display:flex;align-items:center;gap:.3rem;color:var(--text-3);">
+          <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="2" y="5" width="12" height="6" rx="1"/><line x1="5" y1="5" x2="5" y2="11"/><line x1="11" y1="5" x2="11" y2="11"/><rect x="4" y="3" width="2" height="2" rx=".5"/><rect x="10" y="3" width="2" height="2" rx=".5"/></svg>
+          CPU
+        </span>
+        <span style="color:var(--text-2);">{{ limits.cpu }} vCPU</span>
+      </div>
+      <div class="flex-b">
+        <span style="display:flex;align-items:center;gap:.3rem;color:var(--text-3);">
+          <svg class="icon icon-sm" viewBox="0 0 16 16"><ellipse cx="8" cy="5" rx="6" ry="2.5"/><path d="M2 5v6c0 1.4 2.7 2.5 6 2.5s6-1.1 6-2.5V5"/><path d="M2 8c0 1.4 2.7 2.5 6 2.5S14 9.4 14 8"/></svg>
+          MEM
+        </span>
+        <span style="color:var(--text-2);">{{ limits.ram }}GB</span>
+      </div>
+      <div class="flex-b">
+        <span style="display:flex;align-items:center;gap:.3rem;color:var(--text-3);">
+          <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5"/><line x1="5" y1="7" x2="11" y2="7"/><circle cx="12" cy="11" r="1" fill="currentColor" stroke="none"/></svg>
+          DISK
+        </span>
+        <span style="color:var(--text-2);">{{ limits.disk }}GB</span>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if feedback_rows %}
+  <div class="card card-sm">
+    <div class="card-title">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><path d="M13 2H3a1 1 0 00-1 1v8a1 1 0 001 1h3l2 2 2-2h3a1 1 0 001-1V3a1 1 0 00-1-1z"/></svg>
+      Reviews
+    </div>
+    {% for fb in feedback_rows[:4] %}
+    <div class="review-item">
+      <div class="flex-b">
+        <span class="review-user">{{ fb.username }}</span>
+        <div class="review-stars">
+          {% for i in range(1,6) %}
+          <svg width="10" height="10" viewBox="0 0 16 16" style="{{ 'fill:var(--warn);stroke:var(--warn)' if i <= fb.stars else 'fill:none;stroke:var(--text-3)' }}" stroke-width="1.5"><polygon points="8,2 10,6 15,6.5 11.5,10 12.5,15 8,12.5 3.5,15 4.5,10 1,6.5 6,6"/></svg>
+          {% endfor %}
+        </div>
+      </div>
+      {% if fb.comment %}<div class="review-text">{{ fb.comment[:70] }}</div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+</aside>
+
+<!-- ── Main ── -->
+<main class="main">
+
+{% if not vps %}
+<div class="card" style="text-align:center;padding:3rem 2rem;">
+  <div style="width:44px;height:44px;border:1px solid var(--border);border-radius:var(--r-lg);margin:0 auto 1.1rem;display:flex;align-items:center;justify-content:center;color:var(--text-3);">
+    <svg class="icon-lg" viewBox="0 0 16 16"><rect x="1" y="3" width="14" height="10" rx="2"/><line x1="5" y1="7" x2="11" y2="7"/><line x1="5" y1="10" x2="9" y2="10"/></svg>
+  </div>
+  <h2 style="font-size:1rem;font-weight:600;margin-bottom:.42rem;">No server yet</h2>
+  <p style="color:var(--text-2);font-size:.8rem;margin-bottom:1.5rem;max-width:320px;margin-left:auto;margin-right:auto;">Ubuntu 22.04, root access, browser terminal. Ready in ~2 minutes.</p>
+  <form method="post" action="{{ url_for('vps_create') }}">
+    <button class="btn btn-primary">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><line x1="8" y1="2" x2="8" y2="14"/><line x1="2" y1="8" x2="14" y2="8"/></svg>
+      Create VPS
+    </button>
+  </form>
+</div>
+
+{% elif vps.status in ('queued','creating') %}
+<div class="queue-card" id="buildCard">
+  <div class="queue-ring"></div>
+  <div style="font-size:.68rem;font-family:var(--mono);color:var(--blue);margin-bottom:.42rem;">
+    {% if queue_pos > 0 %}position {{ queue_pos }} — ~{{ queue_pos * slot_seconds }}s{% else %}building now{% endif %}
+  </div>
+  <h2 style="font-size:.95rem;font-weight:600;margin-bottom:.35rem;">Provisioning Ubuntu 22.04</h2>
+  <p style="color:var(--text-2);font-size:.76rem;margin-bottom:1.1rem;">Configuring container, installing access layer.</p>
+  <div class="progress" style="max-width:260px;margin:0 auto .85rem;"><div class="progress-bar" id="buildProg" style="width:4%;transition:width .5s ease;"></div></div>
+  <div id="logBox" style="text-align:left;max-height:150px;overflow-y:auto;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r);padding:.55rem .7rem;font-family:var(--mono);font-size:.68rem;color:var(--text-3);margin-top:.65rem;"></div>
+</div>
+<script>
+(function(){
+  const log=document.getElementById('logBox'),bar=document.getElementById('buildProg');
+  let p=4;
+  const es=new EventSource("{{ url_for('vps_logs', vps_id=vps.id) }}");
+  es.onmessage=e=>{
+    if(e.data==='[DONE]'){es.close();poll();return;}
+    const d=document.createElement('div');d.textContent=e.data;log.appendChild(d);log.scrollTop=9999;
+    p=Math.min(p+2,88);bar.style.width=p+'%';
+  };
+  function poll(){fetch("{{ url_for('vps_queue_status', vps_id=vps.id) }}").then(r=>r.json()).then(d=>{if(d.status==='running'){bar.style.width='100%';setTimeout(()=>location.reload(),500);}else if(d.status==='failed')location.reload();else setTimeout(poll,4000);});}
+  setInterval(poll,10000);
+})();
+</script>
+
+{% elif vps.status == 'failed' %}
+<div class="card">
+  <div class="alert alert-error">Build failed: {{ vps.ssh_command }}</div>
+  <form method="post" action="{{ url_for('vps_dismiss', vps_id=vps.id) }}">
+    <button class="btn btn-ghost btn-sm">Dismiss</button>
+  </form>
+</div>
+
+{% else %}
+
+<!-- stats -->
+<div class="stats-grid">
+  <div class="stat-card">
+    <div class="stat-label">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="2" y="4" width="12" height="8" rx="1.5"/><line x1="5" y1="4" x2="5" y2="12"/><line x1="11" y1="4" x2="11" y2="12"/><rect x="4" y="2" width="2" height="2" rx=".5"/><rect x="10" y="2" width="2" height="2" rx=".5"/></svg>
+      CPU
+    </div>
+    <div class="stat-val" id="cpuVal">—</div>
+    <div class="progress"><div class="progress-bar" id="cpuBar" style="width:0%"></div></div>
+    <div class="stat-sub" id="cpuSub">usage</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><ellipse cx="8" cy="5" rx="6" ry="2.2"/><path d="M2 5v6c0 1.2 2.7 2.2 6 2.2s6-1 6-2.2V5"/><path d="M2 8c0 1.2 2.7 2.2 6 2.2S14 9.2 14 8"/></svg>
+      MEM
+    </div>
+    <div class="stat-val" id="ramVal">—</div>
+    <div class="progress"><div class="progress-bar" id="ramBar" style="width:0%"></div></div>
+    <div class="stat-sub" id="ramSub">of {{ limits.ram }}GB</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5"/><line x1="5" y1="7" x2="11" y2="7"/><circle cx="12.5" cy="11.5" r=".8" fill="currentColor" stroke="none"/></svg>
+      DISK
+    </div>
+    <div class="stat-val">{{ limits.disk }}<span style="font-size:.75rem;color:var(--text-3);">GB</span></div>
+    <div class="progress"><div class="progress-bar" style="width:8%"></div></div>
+    <div class="stat-sub">quota</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><polyline points="8 4 8 8 11 10"/></svg>
+      UPTIME
+    </div>
+    <div class="stat-val" id="uptimeVal">—</div>
+    <div class="progress"><div class="progress-bar" style="width:0%"></div></div>
+    <div class="stat-sub">running</div>
+  </div>
+</div>
+
+<!-- VPS card -->
+<div class="card">
+  <div class="flex-b" style="margin-bottom:.9rem;flex-wrap:wrap;gap:.55rem;">
+    <div class="flex-c gap-md" style="flex-wrap:wrap;">
+      <div class="flex-c gap-sm">
+        <span class="dot {{ 'dot-green' if vps.status=='running' else 'dot-grey' if vps.status=='stopped' else 'dot-yellow' }}"></span>
+        <span style="font-family:var(--mono);font-size:.8rem;">{{ vps.container_id }}</span>
+      </div>
+      <span class="badge {{ 'badge-green' if vps.status=='running' else 'badge-grey' if vps.status=='stopped' else 'badge-yellow' }}">{{ vps.status }}</span>
+      {% if vps.kvm_enabled %}<span class="badge badge-purple">KVM</span>{% endif %}
+      {% if vps.node_id and vps.node_id > 0 %}<span class="badge badge-blue">node-{{ vps.node_id }}</span>{% endif %}
+    </div>
+    <div class="action-row">
+      {% if vps.status == 'running' %}
+      <form method="post" action="{{ url_for('vps_power', vps_id=vps.id, action='stop') }}">
+        <button class="btn btn-ghost btn-sm">
+          <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="1.5"/></svg>
+          Stop
+        </button>
+      </form>
+      {% elif vps.status == 'stopped' %}
+      <form method="post" action="{{ url_for('vps_power', vps_id=vps.id, action='start') }}">
+        <button class="btn btn-primary btn-sm">
+          <svg class="icon icon-sm" viewBox="0 0 16 16"><polygon points="4,2 14,8 4,14"/></svg>
+          Start
+        </button>
+      </form>
+      {% endif %}
+      <form method="post" action="{{ url_for('vps_power', vps_id=vps.id, action='reinstall') }}"
+            onsubmit="return confirm('Reinstall wipes all container data. Continue?')">
+        <button class="btn btn-warn btn-sm">
+          <svg class="icon icon-sm" viewBox="0 0 16 16"><polyline points="1 4 1 1 4 1"/><path d="M1 1c2-2 8-3 12 1s3 10-1 13"/><polyline points="15 12 15 15 12 15"/></svg>
+          Reinstall
+        </button>
+      </form>
+      <a href="{{ url_for('file_manager', vps_id=vps.id) }}" class="btn btn-ghost btn-sm">
+        <svg class="icon icon-sm" viewBox="0 0 16 16"><path d="M2 4a1 1 0 011-1h4l1.5 2H13a1 1 0 011 1v6a1 1 0 01-1 1H3a1 1 0 01-1-1V4z"/></svg>
+        Files
+      </a>
+    </div>
+  </div>
+
+  <div class="info-grid" style="margin-bottom:.85rem;">
+    <div class="info-item">
+      <span class="info-label">
+        <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="1" y="3" width="14" height="10" rx="2"/><line x1="5" y1="7" x2="11" y2="7"/></svg>
+        Container
+      </span>
+      <span class="info-val">{{ vps.container_id }}</span>
+    </div>
+    <div class="info-item">
+      <span class="info-label">
+        <svg class="icon icon-sm" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><line x1="8" y1="4" x2="8" y2="8"/><line x1="8" y1="8" x2="11" y2="10"/></svg>
+        Created
+      </span>
+      <span class="info-val">{{ vps.created_at | strftime }}</span>
+    </div>
+    <div class="info-item">
+      <span class="info-label">
+        <svg class="icon icon-sm" viewBox="0 0 16 16"><circle cx="4" cy="8" r="2"/><circle cx="12" cy="4" r="2"/><circle cx="12" cy="12" r="2"/><line x1="6" y1="7" x2="10" y2="5"/><line x1="6" y1="9" x2="10" y2="11"/></svg>
+        Node
+      </span>
+      <span class="info-val">{{ 'node-' ~ vps.node_id if vps.node_id else 'node-1' }}</span>
+    </div>
+    <div class="info-item">
+      <span class="info-label">
+        <svg class="icon icon-sm" viewBox="0 0 16 16"><path d="M8 1L1 4v4c0 4 3 6 7 7 4-1 7-3 7-7V4L8 1z"/></svg>
+        OS
+      </span>
+      <span class="info-val">Ubuntu 22.04 LTS</span>
+    </div>
+  </div>
+
+  {% if vps.status == 'running' %}
+  <hr class="divider" style="margin:.7rem 0;">
+  <div class="tabs">
+    <div class="tab active" id="tab-btn-browser" onclick="switchTab('browser')">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="1" y="2" width="14" height="12" rx="2"/><polyline points="4 6 7 8 4 10"/><line x1="9" y1="10" x2="13" y2="10"/></svg>
+      Terminal
+    </div>
+    {% if vps.ssh_command %}
+    <div class="tab" id="tab-btn-sshx" onclick="switchTab('sshx')">
+      <svg class="icon icon-sm" viewBox="0 0 16 16"><path d="M10 3h3a1 1 0 011 1v8a1 1 0 01-1 1h-3"/><polyline points="7 11 10 8 7 5"/><line x1="10" y1="8" x2="2" y2="8"/></svg>
+      sshx
+    </div>
+    {% endif %}
+    <div style="margin-left:auto;display:flex;align-items:center;padding:.2rem 0;">
+      <form method="post" action="{{ url_for('regen_ssh', vps_id=vps.id) }}" style="margin:0;">
+        <button class="btn btn-ghost btn-sm">
+          <svg class="icon icon-sm" viewBox="0 0 16 16"><polyline points="1 4 1 1 4 1"/><path d="M1 1c2-2 8-3 12 1s3 10-1 13"/></svg>
+          Regen
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <div id="tab-browser" class="terminal-wrap">
+    <div class="terminal-titlebar">
+      <div class="tbar-dot" style="background:#ff5f57;"></div>
+      <div class="tbar-dot" style="background:#febc2e;margin-left:4px;"></div>
+      <div class="tbar-dot" style="background:#28c840;margin-left:4px;"></div>
+      <span class="tbar-title">{{ vps.container_id[:20] }}</span>
+    </div>
+    <div id="terminal-output"></div>
+    <div id="terminal-input-row">
+      <span class="t-prompt">~#</span>
+      <input id="terminal-cmd" type="text" autocomplete="off" spellcheck="false" placeholder="command">
+    </div>
+  </div>
+
+  {% if vps.ssh_command %}
+  <div id="tab-sshx" style="display:none;padding:.85rem 0;">
+    <p style="font-size:.76rem;color:var(--text-2);margin-bottom:.65rem;">Full terminal with colour support, session sharing and mobile access.</p>
+    <div style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;">
+      <code style="flex:1;padding:.5rem .65rem;font-size:.72rem;word-break:break-all;display:block;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--r);">{{ vps.ssh_command }}</code>
+      <a href="{{ vps.ssh_command }}" target="_blank" rel="noopener" class="btn btn-primary btn-sm">
+        <svg class="icon icon-sm" viewBox="0 0 16 16"><path d="M10 3h3a1 1 0 011 1v8a1 1 0 01-1 1h-3"/><polyline points="7 11 10 8 7 5"/><line x1="10" y1="8" x2="2" y2="8"/></svg>
+        Open
+      </a>
+      <button class="btn btn-ghost btn-sm" onclick="navigator.clipboard.writeText('{{ vps.ssh_command }}')">
+        <svg class="icon icon-sm" viewBox="0 0 16 16"><rect x="5" y="3" width="9" height="11" rx="1.5"/><path d="M3 5H2a1 1 0 00-1 1v8a1 1 0 001 1h8a1 1 0 001-1v-1"/></svg>
+        Copy
+      </button>
+    </div>
+  </div>
+  {% endif %}
+  {% endif %}
+</div>
+
+{% if can_feedback %}
+<div class="card card-sm">
+  <div class="card-title">
+    <svg class="icon icon-sm" viewBox="0 0 16 16"><polygon points="8,2 10,6 15,6.5 11.5,10 12.5,15 8,12.5 3.5,15 4.5,10 1,6.5 6,6"/></svg>
+    Leave a review
+  </div>
+  <form method="post" action="{{ url_for('submit_feedback') }}">
+    <input type="hidden" name="stars" id="starInput" value="0">
+    <div style="display:flex;align-items:center;gap:.85rem;flex-wrap:wrap;">
+      <div class="stars-input" id="starRow">
+        {% for i in range(1,6) %}
+        <button type="button" class="star-btn" data-v="{{ i }}" onclick="setStar({{ i }})">
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="var(--text-3)" stroke-width="1.5"><polygon points="8,2 10,6 15,6.5 11.5,10 12.5,15 8,12.5 3.5,15 4.5,10 1,6.5 6,6"/></svg>
+        </button>
+        {% endfor %}
+      </div>
+      <input name="comment" class="form-input" placeholder="Optional comment" style="flex:1;min-width:150px;">
+      <button type="submit" class="btn btn-primary btn-sm">Post</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+
+{% endif %}
+</main>
+</div>
+</div>
+
+<script>
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  const btn = document.getElementById('tab-btn-' + name);
+  if (btn) btn.classList.add('active');
+  const b = document.getElementById('tab-browser');
+  const s = document.getElementById('tab-sshx');
+  if (b) b.style.display = name === 'browser' ? '' : 'none';
+  if (s) s.style.display = name === 'sshx'    ? '' : 'none';
+}
+function setStar(v) {
+  document.getElementById('starInput').value = v;
+  document.querySelectorAll('.star-btn').forEach(s => s.classList.toggle('lit', parseInt(s.dataset.v) <= v));
+}
+
+{% if vps and vps.status == 'running' %}
+(function(){
+  const out = document.getElementById('terminal-output');
+  const inp = document.getElementById('terminal-cmd');
+  if (!out || !inp) return;
+  const hist = []; let hi = -1;
+  function line(txt, cls) {
+    const s = document.createElement('span');
+    s.className = 't-line ' + (cls||'t-out');
+    s.textContent = txt + '\n';
+    out.appendChild(s);
+    out.scrollTop = out.scrollHeight;
+  }
+  line('connected to {{ vps.container_id }}', 't-info');
+  inp.addEventListener('keydown', async e => {
+    if (e.key === 'ArrowUp')   { e.preventDefault(); if (hi < hist.length-1){hi++;inp.value=hist[hist.length-1-hi];} return; }
+    if (e.key === 'ArrowDown') { e.preventDefault(); if (hi > 0){hi--;inp.value=hist[hist.length-1-hi];}else{hi=-1;inp.value='';} return; }
+    if (e.key !== 'Enter') return;
+    const cmd = inp.value.trim(); if (!cmd) return;
+    hist.push(cmd); hi = -1;
+    line('# ' + cmd, 't-cmd'); inp.value = '';
+    try {
+      const r = await fetch("{{ url_for('terminal_exec', vps_id=vps.id) }}", {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({cmd})
+      });
+      const d = await r.json();
+      if (d.error) { line('error: '+d.error, 't-err'); return; }
+      (d.output||'').split('\n').forEach(l => line(l, 't-out'));
+      if (d.exit_code !== 0) line('[exit '+d.exit_code+']', 't-err');
+    } catch(err) { line('failed: '+err, 't-err'); }
+  });
+  inp.focus();
+})();
+
+(function(){
+  const cpuV=document.getElementById('cpuVal'),cpuB=document.getElementById('cpuBar');
+  const ramV=document.getElementById('ramVal'),ramB=document.getElementById('ramBar');
+  const ramS=document.getElementById('ramSub'),upV=document.getElementById('uptimeVal');
+  if (!cpuV) return;
+  function fmt(s){if(!s)return'—';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>=24?Math.floor(h/24)+'d '+h%24+'h':h+'h '+m+'m';}
+  function bar(el,pct){el.style.width=Math.min(pct,100)+'%';el.className='progress-bar'+(pct>85?' danger':pct>65?' warn':'');}
+  function poll(){
+    fetch("{{ url_for('vps_stats', vps_id=vps.id) }}").then(r=>r.json()).then(d=>{
+      if(d.error)return;
+      cpuV.textContent=d.cpu_percent.toFixed(1)+'%'; bar(cpuB,d.cpu_percent);
+      ramV.textContent=d.mem_usage_mb+'MB'; bar(ramB,d.mem_percent);
+      if(ramS) ramS.textContent='of '+(d.mem_limit_mb/1024).toFixed(1)+'GB';
+      if(upV)  upV.textContent=fmt(d.uptime_seconds);
+    }).catch(()=>{});
+  }
+  poll(); setInterval(poll,5000);
+})();
+{% endif %}
+</script>
+{% endblock %}

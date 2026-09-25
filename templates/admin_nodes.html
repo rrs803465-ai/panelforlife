@@ -1,0 +1,212 @@
+{% extends "base.html" %}
+{% block title %}Nodes — Panel4Life Admin{% endblock %}
+{% block head %}
+<style>
+.node-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:1.25rem; margin-bottom:1.75rem; }
+.node-card {
+  background:var(--bg-1); border:1px solid var(--border);
+  border-radius:var(--radius-lg); padding:1.25rem; position:relative;
+}
+.node-card.online  { border-color:rgba(63,185,80,.3); }
+.node-card.offline { border-color:rgba(248,81,73,.2); }
+.node-card.this-node { border-color:rgba(56,139,253,.35); background:rgba(56,139,253,.03); }
+.node-hdr { display:flex; align-items:center; justify-content:space-between; margin-bottom:1rem; }
+.node-name { font-family:var(--mono); font-size:.82rem; font-weight:600; color:var(--text); }
+.node-url { font-family:var(--mono); font-size:.7rem; color:var(--text-3); margin-top:.15rem; word-break:break-all; }
+.node-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:.65rem; margin:.85rem 0; }
+.ns { background:var(--bg-2); border-radius:var(--radius); padding:.55rem .65rem; }
+.ns-val { font-family:var(--mono); font-size:.88rem; font-weight:600; color:var(--text); }
+.ns-lbl { font-size:.65rem; color:var(--text-3); margin-top:.1rem; }
+.capacity-bar { margin:.65rem 0 .25rem; }
+.capacity-label { display:flex; justify-content:space-between; font-size:.7rem; color:var(--text-3); margin-bottom:.3rem; }
+.node-actions { display:flex; gap:.5rem; margin-top:1rem; padding-top:.85rem; border-top:1px solid var(--border); }
+
+/* Bootstrap log box */
+.bootstrap-log {
+  margin-top:.85rem; background:var(--bg);
+  border:1px solid var(--border); border-radius:var(--radius);
+  padding:.65rem; font-family:var(--mono); font-size:.7rem;
+  color:var(--text-3); max-height:140px; overflow-y:auto; display:none;
+}
+
+/* Pair form */
+.pair-card { background:var(--bg-1); border:1px solid var(--border); border-radius:var(--radius-lg); padding:1.5rem; }
+</style>
+{% endblock %}
+{% block body %}
+<div class="page">
+  <div class="page-hdr flex-b" style="margin-bottom:1.75rem;">
+    <div>
+      <h1>Node mesh</h1>
+      <p>Manage linked nodes. New VPSes overflow automatically when a node hits {{ max_vps }}.</p>
+    </div>
+    <a href="{{ url_for('admin') }}" class="btn btn-ghost btn-sm">← Admin panel</a>
+  </div>
+
+  {% if result %}
+  <div class="alert {{ 'alert-success' if result[0] else 'alert-error' }}" style="margin-bottom:1.5rem;">
+    {{ result[1] }}
+    {% if result[0] %}
+    <div style="margin-top:.5rem;font-size:.75rem;opacity:.7;">LXD bootstrap is running in the background on the new node. Check the node card below for live logs.</div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- ── This node ─────────────────────────────────────────────────── -->
+  <div class="node-grid" style="margin-bottom:1rem;">
+    <div class="node-card this-node">
+      <div class="node-hdr">
+        <div>
+          <div class="node-name">This node <span class="badge badge-blue" style="font-size:.6rem;vertical-align:middle;">PRIMARY</span></div>
+          <div class="node-url">{{ my_url if my_url else 'URL auto-detecting — send an HTTP request to latch it' }}</div>
+        </div>
+        <span class="dot-status dot-green"></span>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.85rem;flex-wrap:wrap;">
+        <span class="badge badge-grey">Code: <span style="font-family:var(--mono);font-size:.72rem;letter-spacing:.05em;">{{ my_code }}</span></span>
+        <button class="btn btn-ghost btn-sm" onclick="navigator.clipboard.writeText('{{ my_code }}')">Copy code</button>
+      </div>
+
+      <div class="capacity-label">
+        <span>VPS capacity</span>
+        <span id="thisVpsCount">—</span> / {{ max_vps }}
+      </div>
+      <div class="progress">
+        <div class="progress-bar" id="thisVpsBar" style="width:0%"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Peer nodes ─────────────────────────────────────────────────── -->
+  {% if nodes %}
+  <div class="node-grid">
+    {% for n in nodes %}
+    {% set online = (now - n.last_seen) < 120 if n.last_seen else false %}
+    {% set cap_pct = ((n.vps_count / max_vps) * 100) | int %}
+    <div class="node-card {{ 'online' if online else 'offline' }}" id="nodeCard{{ n.id }}">
+      <div class="node-hdr">
+        <div>
+          <div class="node-name">{{ n.label or ('Node ' ~ n.id) }}</div>
+          <div class="node-url"><a href="{{ n.url }}" target="_blank" rel="noopener">{{ n.url }}</a></div>
+        </div>
+        <span class="dot-status {{ 'dot-green' if online else 'dot-red' }}"></span>
+      </div>
+
+      <div class="node-stats">
+        <div class="ns">
+          <div class="ns-val">{{ n.vps_count }}</div>
+          <div class="ns-lbl">VPSes</div>
+        </div>
+        <div class="ns">
+          <div class="ns-val">{{ n.cpu_cores or '—' }}</div>
+          <div class="ns-lbl">vCPU</div>
+        </div>
+        <div class="ns">
+          <div class="ns-val">{{ ((n.ram_mb or 0) / 1024) | int }}GB</div>
+          <div class="ns-lbl">RAM</div>
+        </div>
+      </div>
+
+      <div class="capacity-label">
+        <span>Capacity</span>
+        <span>{{ n.vps_count }} / {{ max_vps }} ({{ cap_pct }}%)</span>
+      </div>
+      <div class="progress capacity-bar">
+        <div class="progress-bar {{ 'danger' if cap_pct > 85 else 'warn' if cap_pct > 65 else '' }}"
+             style="width:{{ cap_pct }}%"></div>
+      </div>
+
+      <div style="font-size:.7rem;color:var(--text-3);margin-top:.4rem;">
+        {% if online %}
+        Last seen {{ now - n.last_seen }}s ago
+        {% else %}
+        Offline — last seen {{ ((now - n.last_seen) / 60) | int }}m ago
+        {% endif %}
+        {% if n.bootstrapped %} &middot; <span style="color:var(--accent);">✓ LXD ready</span>{% else %} &middot; <span style="color:var(--warn);">Bootstrap pending</span>{% endif %}
+        {% if n.disk_gb %} &middot; {{ n.disk_gb }}GB disk{% endif %}
+      </div>
+
+      {% if not n.bootstrapped %}
+      <button class="btn btn-ghost btn-sm" style="margin-top:.65rem;" onclick="showBootLog({{ n.id }},'{{ n.url }}')">
+        View bootstrap logs
+      </button>
+      <div class="bootstrap-log" id="bootLog{{ n.id }}">Loading…</div>
+      {% endif %}
+
+      <div class="node-actions">
+        <form method="post" action="{{ url_for('admin_node_remove', node_id=n.id) }}"
+              onsubmit="return confirm('Remove this node from mesh?')">
+          <button class="btn btn-danger btn-sm">Remove</button>
+        </form>
+        <a href="{{ n.url }}" target="_blank" class="btn btn-ghost btn-sm">Open panel ↗</a>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card" style="text-align:center;padding:2.5rem;margin-bottom:1.75rem;">
+    <div style="font-size:2rem;margin-bottom:.75rem;opacity:.4;">🔗</div>
+    <div style="font-size:.88rem;color:var(--text-2);">No peer nodes linked yet. Pair a second node below to enable overflow VPS creation.</div>
+  </div>
+  {% endif %}
+
+  <!-- ── Pair a new node ─────────────────────────────────────────────── -->
+  <div class="pair-card">
+    <div class="card-title">Link a new node</div>
+    <p style="font-size:.82rem;color:var(--text-2);margin-bottom:1.25rem;line-height:1.6;">
+      On the second server, start panel4life. Then enter its URL and the 8-digit code from its startup output.
+      This node will send a POST request to <code>/api/node/pair</code> on the remote node — if authentication passes,
+      both nodes are linked and LXD is bootstrapped automatically on this node.
+    </p>
+    <form method="post" class="form-row" style="align-items:flex-end;">
+      <div class="form-group" style="margin:0;">
+        <label class="form-label">Remote node URL</label>
+        <input name="remote_url" class="form-input" placeholder="https://node2.example.com">
+      </div>
+      <div class="form-group" style="margin:0;">
+        <label class="form-label">8-digit code (from that node's console)</label>
+        <input name="remote_code" class="form-input" placeholder="12345678" maxlength="8" style="font-family:var(--mono);letter-spacing:.08em;">
+      </div>
+      <button type="submit" class="btn btn-primary">Link node</button>
+    </form>
+    <div style="margin-top:1rem;padding-top:1rem;border-top:1px solid var(--border);font-size:.75rem;color:var(--text-3);">
+      The link runs: <code>POST {remote_url}/api/node/pair</code> with <code>Authorization: {code}</code>.
+      On success, LXD is initialised automatically on the new node: <code>lxd init --auto</code>,
+      <code>lxc image copy ubuntu:22.04 local: --alias ubuntu/22.04</code>,
+      <code>lxc storage create zfs-new zfs size=6144GB</code>.
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Bootstrap log polling
+function showBootLog(nodeId, nodeUrl){
+  const box = document.getElementById('bootLog'+nodeId);
+  box.style.display = 'block';
+  function poll(){
+    fetch('/api/node/bootstrap_status?url='+encodeURIComponent(nodeUrl))
+      .then(r=>r.json()).then(d=>{
+        box.innerHTML = d.logs.map(l=>`<div>${l}</div>`).join('');
+        box.scrollTop = box.scrollHeight;
+        if(!d.done) setTimeout(poll, 2000);
+        else box.innerHTML += '<div style="color:var(--accent);margin-top:.4rem;">— Done —</div>';
+      }).catch(()=>{});
+  }
+  poll();
+}
+
+// ── This node VPS count from stats endpoint (best effort)
+fetch('/vps/stats_summary').then(r=>r.json()).then(d=>{
+  const el = document.getElementById('thisVpsCount');
+  const bar = document.getElementById('thisVpsBar');
+  if(el && d.vps_count !== undefined){
+    el.textContent = d.vps_count;
+    const pct = Math.round((d.vps_count / {{ max_vps }}) * 100);
+    bar.style.width = pct+'%';
+    if(pct > 85) bar.classList.add('danger');
+    else if(pct > 65) bar.classList.add('warn');
+  }
+}).catch(()=>{});
+</script>
+{% endblock %}

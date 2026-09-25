@@ -1,0 +1,273 @@
+{% extends "base.html" %}
+{% block title %}Admin — Panel4Life{% endblock %}
+{% block head %}
+<style>
+.admin-layout { display:grid; grid-template-columns:220px 1fr; gap:1.5rem; padding:1.5rem; max-width:1400px; margin:0 auto; }
+.admin-nav { display:flex; flex-direction:column; gap:.25rem; }
+.admin-nav a {
+  display:flex; align-items:center; gap:.5rem; padding:.5rem .75rem;
+  border-radius:var(--radius); font-size:.82rem; color:var(--text-2);
+  transition:all .12s; border:1px solid transparent;
+}
+.admin-nav a:hover, .admin-nav a.active { background:var(--bg-2); color:var(--text); border-color:var(--border); }
+.admin-section { display:none; }
+.admin-section.active { display:block; }
+.tab-nav { display:flex; gap:0; border-bottom:1px solid var(--border); margin-bottom:1.5rem; }
+.tab-btn { padding:.55rem 1rem; font-size:.82rem; color:var(--text-3); cursor:pointer; border-bottom:2px solid transparent; transition:all .12s; background:none; border-left:none;border-right:none;border-top:none; }
+.tab-btn:hover { color:var(--text-2); }
+.tab-btn.active { color:var(--accent); border-bottom-color:var(--accent); }
+@media(max-width:900px){ .admin-layout{grid-template-columns:1fr;} .admin-nav{flex-direction:row;flex-wrap:wrap;} }
+</style>
+{% endblock %}
+{% block body %}
+<div class="admin-layout">
+  <nav>
+    <div class="card-title" style="padding:.5rem .75rem;">Admin</div>
+    <div class="admin-nav">
+      <a href="#" onclick="showSec('overview')" id="nav-overview" class="active">📊 Overview</a>
+      <a href="#" onclick="showSec('vpses')"    id="nav-vpses">🖥️ VPSes</a>
+      <a href="#" onclick="showSec('users')"    id="nav-users">👤 Users</a>
+      <a href="#" onclick="showSec('grant')"    id="nav-grant">⚡ Grant VPS</a>
+      <a href="#" onclick="showSec('config')"   id="nav-config">⚙️ Config</a>
+      <a href="#" onclick="showSec('broadcast')" id="nav-broadcast">📢 Broadcast</a>
+      <a href="{{ url_for('admin_nodes') }}" style="color:var(--blue);">🔗 Nodes →</a>
+    </div>
+  </nav>
+
+  <main>
+    <!-- ── Overview ── -->
+    <div class="admin-section active" id="sec-overview">
+      <div class="page-hdr"><h1>Overview</h1></div>
+      <div class="grid-4" style="margin-bottom:1.5rem;">
+        <div class="stat-card">
+          <div class="val">{{ vpses|length }}</div>
+          <div class="lbl">Total VPSes</div>
+        </div>
+        <div class="stat-card">
+          <div class="val">{{ vpses|selectattr('status','equalto','running')|list|length }}</div>
+          <div class="lbl">Running</div>
+        </div>
+        <div class="stat-card">
+          <div class="val">{{ users|length }}</div>
+          <div class="lbl">Users</div>
+        </div>
+        <div class="stat-card">
+          <div class="val">{{ queue_length }}</div>
+          <div class="lbl">In queue</div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Host resources</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem;">
+            <div><div style="font-family:var(--mono);font-size:1.1rem;color:var(--text);">{{ host.cpu_cores }}</div><div class="text-xs text-dim">CPU cores</div></div>
+            <div><div style="font-family:var(--mono);font-size:1.1rem;color:var(--text);">{{ (host.ram_mb/1024)|int }}GB</div><div class="text-xs text-dim">RAM</div></div>
+            <div><div style="font-family:var(--mono);font-size:1.1rem;color:var(--text);">{{ host.disk_allocated_gb }}GB</div><div class="text-xs text-dim">Disk allocated</div></div>
+            <div><div style="font-family:var(--mono);font-size:1.1rem;color:var(--text);">{{ host.real_disk_gb or '—' }}GB</div><div class="text-xs text-dim">Real disk</div></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Node info</div>
+          <div style="display:flex;flex-direction:column;gap:.5rem;">
+            <div><span class="text-dim text-xs">Node code:</span> <code style="font-size:.78rem;">{{ node_code }}</code></div>
+            <div><span class="text-dim text-xs">Node URL:</span> <code style="font-size:.72rem;word-break:break-all;">{{ node_url or 'detecting…' }}</code></div>
+            <div><span class="text-dim text-xs">Max VPS/node:</span> <span class="text-sm">{{ max_vps }}</span></div>
+          </div>
+          <div style="margin-top:.75rem;"><a href="{{ url_for('admin_nodes') }}" class="btn btn-ghost btn-sm">Manage nodes →</a></div>
+        </div>
+      </div>
+
+      {% if queue_entries %}
+      <div class="card" style="margin-top:1.25rem;">
+        <div class="card-title">Build queue ({{ queue_length }})</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Position</th><th>User ID</th><th>VPS ID</th></tr></thead>
+            <tbody>
+              {% for e in queue_entries %}
+              <tr><td>{{ loop.index }}</td><td class="mono">{{ e.user_id }}</td><td class="mono">{{ e.vps_id }}</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- ── VPS list ── -->
+    <div class="admin-section" id="sec-vpses">
+      <div class="page-hdr"><h1>All VPSes</h1></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>User</th><th>Container</th><th>Status</th><th>KVM</th><th>Node</th><th>Actions</th></tr>
+          </thead>
+          <tbody>
+            {% for v in vpses %}
+            <tr>
+              <td class="mono">{{ v.id }}</td>
+              <td class="mono">{{ v.username }}</td>
+              <td class="mono" style="font-size:.72rem;max-width:180px;" class="truncate">{{ v.container_id }}</td>
+              <td>
+                <span class="badge {{ 'badge-green' if v.status=='running' else 'badge-red' if v.status in ('failed','suspended') else 'badge-yellow' if v.status in ('creating','queued') else 'badge-grey' }}">
+                  {{ v.status }}
+                </span>
+              </td>
+              <td>{% if v.kvm_enabled %}<span class="badge badge-purple">KVM</span>{% else %}—{% endif %}</td>
+              <td class="mono">{{ v.node_id or 1 }}</td>
+              <td>
+                <div style="display:flex;gap:.3rem;flex-wrap:wrap;">
+                  {% if v.status == 'running' %}
+                  <form method="post" action="{{ url_for('admin_vps_action', vps_id=v.id, action='suspend') }}">
+                    <button class="btn btn-warn btn-sm">Suspend</button>
+                  </form>
+                  {% elif v.status == 'suspended' %}
+                  <form method="post" action="{{ url_for('admin_vps_action', vps_id=v.id, action='unsuspend') }}">
+                    <button class="btn btn-primary btn-sm">Unsuspend</button>
+                  </form>
+                  {% endif %}
+                  {% if host_kvm %}
+                  {% if v.kvm_enabled %}
+                  <form method="post" action="{{ url_for('admin_vps_action', vps_id=v.id, action='disable_kvm') }}">
+                    <button class="btn btn-ghost btn-sm">KVM off</button>
+                  </form>
+                  {% else %}
+                  <form method="post" action="{{ url_for('admin_vps_action', vps_id=v.id, action='enable_kvm') }}">
+                    <button class="btn btn-ghost btn-sm">KVM on</button>
+                  </form>
+                  {% endif %}
+                  {% endif %}
+                  <form method="post" action="{{ url_for('admin_vps_action', vps_id=v.id, action='delete') }}"
+                        onsubmit="return confirm('Delete VPS {{ v.container_id }}?')">
+                    <button class="btn btn-danger btn-sm">Delete</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── Users ── -->
+    <div class="admin-section" id="sec-users">
+      <div class="page-hdr"><h1>Users</h1></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>ID</th><th>Username</th><th>Signup IP</th><th>Admin</th><th>VPN</th><th>Created</th></tr></thead>
+          <tbody>
+            {% for u in users %}
+            <tr>
+              <td class="mono">{{ u.id }}</td>
+              <td class="mono">{{ u.username }}</td>
+              <td class="mono">{{ u.signup_ip }}</td>
+              <td>{% if u.is_admin %}<span class="badge badge-purple">admin</span>{% endif %}</td>
+              <td>{% if u.is_vpn_signup %}<span class="badge badge-yellow" title="{{ u.vpn_provider }}">VPN</span>{% endif %}</td>
+              <td class="mono text-xs text-dim">{{ u.created_at }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── Grant VPS ── -->
+    <div class="admin-section" id="sec-grant">
+      <div class="page-hdr"><h1>Grant VPS to user</h1></div>
+      <div class="card" style="max-width:520px;">
+        <form method="post" action="{{ url_for('admin_grant_vps') }}">
+          <div class="form-group">
+            <label class="form-label">Username</label>
+            <input name="username" class="form-input" placeholder="target_username">
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">CPU cores</label>
+              <input name="cpu_cores" type="number" class="form-input" min="1" max="20" value="4">
+            </div>
+            <div class="form-group">
+              <label class="form-label">RAM (GB)</label>
+              <input name="ram_gb" type="number" class="form-input" min="1" max="160" value="8">
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Disk (GB)</label>
+            <input name="disk_gb" type="number" class="form-input" min="5" max="500" value="100">
+          </div>
+          {% if host_kvm %}
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:.6rem;cursor:pointer;font-size:.85rem;color:var(--text-2);">
+              <input type="checkbox" name="kvm_enabled" value="1" style="accent-color:var(--purple);">
+              Enable KVM virtualisation <span class="badge badge-purple" style="font-size:.65rem;">host supports</span>
+            </label>
+            <div class="form-hint">Grants /dev/kvm access. Only for users who need nested virtualisation.</div>
+          </div>
+          {% else %}
+          <div class="alert alert-warn" style="margin-bottom:1rem;font-size:.78rem;">
+            KVM is not available on this host (/dev/kvm missing or kvm module not loaded).
+          </div>
+          {% endif %}
+          <button type="submit" class="btn btn-primary">Create VPS</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- ── Config ── -->
+    <div class="admin-section" id="sec-config">
+      <div class="page-hdr"><h1>Free-tier limits</h1><p>Applied to every VPS created through the public panel.</p></div>
+      <div class="card" style="max-width:400px;">
+        <form method="post" action="{{ url_for('admin_update_config') }}">
+          <div class="form-group">
+            <label class="form-label">CPU cores per VPS</label>
+            <input name="vps_cpu_cores" type="number" class="form-input" min="1" max="32" value="{{ config.get('vps_cpu_cores',4) }}">
+          </div>
+          <div class="form-group">
+            <label class="form-label">RAM per VPS (GB)</label>
+            <input name="vps_ram_gb" type="number" class="form-input" min="1" max="256" value="{{ config.get('vps_ram_gb',4) }}">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Disk per VPS (GB)</label>
+            <input name="vps_disk_gb" type="number" class="form-input" min="5" max="2000" value="{{ config.get('vps_disk_gb',80) }}">
+          </div>
+          <button type="submit" class="btn btn-primary">Save limits</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- ── Broadcast ── -->
+    <div class="admin-section" id="sec-broadcast">
+      <div class="page-hdr"><h1>Broadcast message</h1></div>
+      <div class="card" style="max-width:520px;">
+        {% if broadcast and broadcast.active %}
+        <div class="alert alert-info" style="margin-bottom:1rem;">Active: "{{ broadcast.message }}"</div>
+        <form method="post" action="{{ url_for('admin_broadcast_clear') }}" style="margin-bottom:1.25rem;">
+          <button class="btn btn-ghost btn-sm">Clear message</button>
+        </form>
+        <hr class="divider">
+        {% endif %}
+        <form method="post" action="{{ url_for('admin_broadcast_set') }}">
+          <div class="form-group">
+            <label class="form-label">New message</label>
+            <input name="message" class="form-input" placeholder="Scheduled maintenance at 03:00 UTC…" maxlength="500">
+          </div>
+          <button type="submit" class="btn btn-primary">Post message</button>
+        </form>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+function showSec(name){
+  document.querySelectorAll('.admin-section').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.admin-nav a').forEach(a=>a.classList.remove('active'));
+  const sec = document.getElementById('sec-'+name);
+  const nav = document.getElementById('nav-'+name);
+  if(sec) sec.classList.add('active');
+  if(nav) nav.classList.add('active');
+  event.preventDefault();
+}
+</script>
+{% endblock %}

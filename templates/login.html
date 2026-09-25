@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Sign in — Panel4Life{% endblock %}
+{% block body %}
+<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:2rem;">
+  <div style="width:100%;max-width:380px;">
+    <div style="text-align:center;margin-bottom:2rem;">
+      <div style="font-family:var(--mono);font-size:1.1rem;font-weight:600;color:var(--text);margin-bottom:.4rem;">
+        Panel<span style="color:var(--accent)">4</span>Life
+      </div>
+      <div style="font-size:.85rem;color:var(--text-2);">Sign in to your account</div>
+    </div>
+    {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+    <div class="card">
+      <form method="post">
+        <div class="form-group">
+          <label class="form-label">Username</label>
+          <input name="username" class="form-input" placeholder="your_username" autocomplete="username" autofocus>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Password</label>
+          <input name="password" type="password" class="form-input" placeholder="••••••••" autocomplete="current-password">
+        </div>
+        <button type="submit" class="btn btn-primary btn-full" style="margin-top:.5rem;">Sign in</button>
+      </form>
+    </div>
+    <div style="text-align:center;margin-top:1.25rem;font-size:.8rem;color:var(--text-3);display:flex;justify-content:center;gap:1.5rem;">
+      <a href="{{ url_for('register') }}" style="color:var(--text-2);">Create account</a>
+      <a href="{{ url_for('forgot_password') }}" style="color:var(--text-2);">Forgot password</a>
+    </div>
+  </div>
+</div>
+{% endblock %}
