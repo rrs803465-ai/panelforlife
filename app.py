@@ -1,1343 +1,871 @@
 """
-Panel4Life — rewritten app.py
+LXD container management — rewritten.
 
-New features vs v1:
-  1. In-browser terminal via exec_command polling + WebSocket-compatible
-     /vps/<id>/terminal/exec endpoint (works alongside sshx).
-  2. File manager — list/upload/download/delete/mkdir per VPS.
-  3. Node auto-URL detection — no manual NODE_PUBLIC_URL required.
-  4. Cascading node routing — when this node hits 150 VPSes, redirect
-     the creation request to the least-loaded available peer node.
-  5. Per-VPS resource limits read from panel_config (set in setup.py).
-  6. Node stats push / nodes admin tab shows live peer stats + online status.
-  7. YouTube-verified badge (carried over, cleaned up).
-  + Port forwarding completely removed.
-  + GET-based inter-node calls replaced with POST + Authorization header.
+Changes from v1:
+  - Port forwarding completely removed.
+  - Per-VPS resource limits are read from panel_config (set in setup.py)
+    rather than being hardcoded constants.
+  - File manager helpers: list_files(), upload_file(), delete_file(),
+    download_file(), create_dir() — all exec into the container.
+  - Terminal websocket helper: exec_stream() for xterm.js integration.
+  - sshx session URL is still generated and stored for browser terminal
+    fallback and the new embedded terminal.
 """
 
 import os
-import sqlite3
+import re
 import time
+import shutil
+import sqlite3
 import secrets
-import threading
+import string
 import base64
-from datetime import timedelta
 
-from flask import (
-    Flask, request, render_template, redirect, url_for,
-    jsonify, session, Response, stream_with_context,
-    send_from_directory, flash, abort
-)
-from flask_login import (
-    LoginManager, UserMixin, login_user, logout_user,
-    login_required, current_user
-)
-from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.middleware.proxy_fix import ProxyFix
+from pylxd import Client
+from pylxd.exceptions import LXDAPIException, NotFound as LXDNotFound
 
-from vps import (
-    create_vps_container, destroy_vps, suspend_vps, unsuspend_vps,
-    regen_sshx, get_container_stats, build_logs_stream,
-    can_create_vps, can_allocate_disk, MAX_VPS_PER_NODE,
-    get_host_capacity, start_vps, stop_vps, reinstall_vps,
-    get_vps_status, sync_status,
-    list_files, read_file_b64, write_file_b64,
-    delete_file, create_directory, exec_command,
-    get_free_vps_cpu, get_free_vps_ram, get_free_vps_disk,
-    kvm_available, set_kvm_enabled,
-)
-from monitor import start_monitor
-import queue_manager as queue
-import node_mesh
-import ip_intel
+# ── regexes ────────────────────────────────────────────────────────────────
+SSHX_LINK_RE  = re.compile(r"https://sshx\.io/s/[A-Za-z0-9]+#[A-Za-z0-9_-]+")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
-# ── Flask setup ─────────────────────────────────────────────────────────────
+client = Client()
 
-app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+IMAGE_ALIAS  = os.environ.get("VPS_IMAGE_ALIAS",  "ubuntu/22.04")
+STORAGE_POOL = os.environ.get("VPS_STORAGE_POOL", "zfs-new")
+DB           = "panel.db"
 
-SECRET_KEY_FILE = "secret.key"
-if os.environ.get("FLASK_SECRET_KEY"):
-    app.secret_key = os.environ["FLASK_SECRET_KEY"]
-elif os.path.exists(SECRET_KEY_FILE):
-    with open(SECRET_KEY_FILE) as f:
-        app.secret_key = f.read().strip()
-else:
-    _key = secrets.token_hex(32)
-    with open(SECRET_KEY_FILE, "w") as f:
-        f.write(_key)
-    app.secret_key = _key
-
-app.config["REMEMBER_COOKIE_DURATION"] = timedelta(days=30)
-
-DB = "panel.db"
-login_manager = LoginManager(app)
-login_manager.login_view = "login"
-
-# Admin-granted VPS hard ceilings
-ADMIN_MAX_RAM_GB    = 160
-ADMIN_MAX_CPU_CORES = 20
-ADMIN_MAX_DISK_GB   = 500
-
-# Debounce maps (in-process — fine for single-worker gunicorn)
-_last_create_click: dict = {}
-_last_power_action: dict = {}
-CREATE_DEBOUNCE_SECONDS   = 10
-POWER_DEBOUNCE_SECONDS    = 10
-REINSTALL_DEBOUNCE_SECONDS = 60
+MAX_VPS_PER_NODE  = 150
+TOTAL_DISK_BUDGET_GB = 6 * 1024   # 6 TB panel-wide ceiling
+MIN_FREE_DISK_GB  = 100
 
 
-# ── DB helpers ───────────────────────────────────────────────────────────────
+# ── KVM availability detection ──────────────────────────────────────────────
+# Checked once at import time so every call to kvm_available() is free.
+# /dev/kvm is the definitive signal — if it's absent the kernel doesn't
+# expose hardware virtualisation to userspace and there's nothing to offer.
+import subprocess as _subprocess
 
-def get_db():
-    db = sqlite3.connect(DB)
-    db.row_factory = sqlite3.Row
-    return db
+def _probe_kvm() -> bool:
+    """Live probe — called each time so late LXD startup or module load is detected."""
+    if not os.path.exists("/dev/kvm"):
+        return False
+    try:
+        out = _subprocess.run(
+            ["lsmod"], capture_output=True, text=True, timeout=4
+        ).stdout
+        return "kvm" in out.lower()
+    except Exception:
+        return True   # lsmod unavailable — trust /dev/kvm presence
 
 
-def init_db():
-    db = get_db()
-    db.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        signup_ip TEXT NOT NULL,
-        is_admin INTEGER DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        recovery_code_hash TEXT,
-        recovery_code_shown INTEGER DEFAULT 0,
-        youtube_verified INTEGER DEFAULT 0,
-        is_vpn_signup INTEGER DEFAULT 0,
-        vpn_provider TEXT
-    );
-    CREATE TABLE IF NOT EXISTS vps (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        container_id TEXT NOT NULL,
-        ssh_command TEXT,
-        status TEXT DEFAULT 'creating',
-        creator_ip TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        last_regen INTEGER DEFAULT 0,
-        node_id INTEGER DEFAULT 0,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-    CREATE TABLE IF NOT EXISTS feedback (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        stars INTEGER NOT NULL,
-        comment TEXT,
-        created_at INTEGER NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    );
-    CREATE TABLE IF NOT EXISTS broadcast (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        message TEXT,
-        active INTEGER DEFAULT 0,
-        updated_at INTEGER
-    );
-    CREATE TABLE IF NOT EXISTS panel_config (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    );
-    """)
-    db.execute("INSERT OR IGNORE INTO broadcast(id,message,active,updated_at) VALUES(1,'',0,0)")
+def kvm_available() -> bool:
+    """Returns True if /dev/kvm exists and the kvm kernel module is loaded.
+    Re-probes every call so a late LXD start or module load is picked up.
+    """
+    return _probe_kvm()
 
-    # Best-effort column migrations for older DBs
-    for stmt in [
-        "ALTER TABLE users ADD COLUMN is_vpn_signup INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN vpn_provider TEXT",
-        "ALTER TABLE users ADD COLUMN youtube_verified INTEGER DEFAULT 0",
-        "ALTER TABLE vps ADD COLUMN node_id INTEGER DEFAULT 0",
-        "ALTER TABLE vps ADD COLUMN kvm_enabled INTEGER DEFAULT 0",
-    ]:
+
+# ── config helpers ──────────────────────────────────────────────────────────
+
+def _get_config(key: str, default: str) -> str:
+    try:
+        db = sqlite3.connect(DB)
+        row = db.execute(
+            "SELECT value FROM panel_config WHERE key=?", (key,)
+        ).fetchone()
+        db.close()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+
+def get_free_vps_cpu()  -> int:  return int(_get_config("vps_cpu_cores", "4"))
+def get_free_vps_ram()  -> int:  return int(_get_config("vps_ram_gb",    "4")) * 1024   # → MB
+def get_free_vps_disk() -> int:  return int(_get_config("vps_disk_gb",   "80"))
+
+
+# ── capacity ────────────────────────────────────────────────────────────────
+
+def get_host_capacity() -> dict:
+    cpu_cores = os.cpu_count() or 1
+    ram_mb = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    ram_mb = int(line.split()[1]) // 1024
+                    break
+    except Exception:
+        pass
+
+    real_disk_gb = None
+    try:
+        usage = shutil.disk_usage("/")
+        real_disk_gb = usage.total // (1024 ** 3)
+    except Exception:
+        pass
+
+    return {
+        "cpu_cores":        cpu_cores,
+        "ram_mb":           ram_mb,
+        "disk_budget_gb":   TOTAL_DISK_BUDGET_GB,
+        "disk_allocated_gb": get_allocated_disk_gb(),
+        "real_disk_gb":     real_disk_gb,
+    }
+
+
+def _quota_gb(inst) -> int:
+    try:
+        size = inst.devices.get("root", {}).get("size", "")
+        if size.upper().endswith("GB"):
+            return int(size[:-2])
+        if size.upper().endswith("TB"):
+            return int(size[:-2]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def get_allocated_disk_gb() -> int:
+    total = 0
+    for inst in client.instances.all():
+        if not inst.name.startswith("vps-"):
+            continue
+        usage = None
         try:
-            db.execute(stmt)
-        except sqlite3.OperationalError:
+            state   = inst.state()
+            usage   = (state.disk or {}).get("root", {}).get("usage")
+        except Exception:
             pass
-
-    # Drop old UNIQUE constraint on vps.user_id if present
-    row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='vps'").fetchone()
-    if row and row["sql"] and "UNIQUE" in row["sql"].upper():
-        db.executescript("""
-        ALTER TABLE vps RENAME TO vps_old;
-        CREATE TABLE vps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            container_id TEXT NOT NULL,
-            ssh_command TEXT,
-            status TEXT DEFAULT 'creating',
-            creator_ip TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            last_regen INTEGER DEFAULT 0,
-            node_id INTEGER DEFAULT 0,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        INSERT INTO vps SELECT id,user_id,container_id,ssh_command,status,
-                               creator_ip,created_at,last_regen,0 FROM vps_old;
-        DROP TABLE vps_old;
-        """)
-
-    db.commit()
-    node_mesh.init_mesh_tables(db)
-    db.close()
+        total += usage if usage else _quota_gb(inst) * (1024 ** 3)
+    return total // (1024 ** 3)
 
 
-# ── URL auto-detection ───────────────────────────────────────────────────────
+def can_allocate_disk(additional_gb: int):
+    allocated   = get_allocated_disk_gb()
+    budget_ok   = (allocated + additional_gb) <= TOTAL_DISK_BUDGET_GB
 
-@app.before_request
-def detect_node_url():
-    """Latches this node's public URL from the first real incoming request."""
-    host  = request.host          # e.g. "panel.example.com" or "1.2.3.4:5000"
-    proto = request.scheme        # "http" or "https"
-    node_mesh.set_detected_url(f"{proto}://{host}")
+    real_free_gb = None
+    try:
+        usage        = shutil.disk_usage("/")
+        real_free_gb = usage.free // (1024 ** 3)
+    except Exception:
+        pass
 
+    safety_ok = real_free_gb is None or real_free_gb >= MIN_FREE_DISK_GB
 
-# ── Context processors ───────────────────────────────────────────────────────
-
-@app.context_processor
-def inject_globals():
-    db  = get_db()
-    row = db.execute("SELECT message, active FROM broadcast WHERE id=1").fetchone()
-    db.close()
-    return dict(
-        broadcast_message=(
-            row["message"] if row and row["active"] and row["message"] else None
-        ),
-        node_url=node_mesh.get_node_url(),
-        node_code=node_mesh.NODE_CODE,
-        kvm_available=kvm_available(),   # Templates use this to show/hide KVM option
-    )
+    if not safety_ok:
+        return False, allocated, TOTAL_DISK_BUDGET_GB, (
+            f"Only {real_free_gb}GB free on disk (keeping {MIN_FREE_DISK_GB}GB reserve)."
+        )
+    if not budget_ok:
+        return False, allocated, TOTAL_DISK_BUDGET_GB, None
+    return True, allocated, TOTAL_DISK_BUDGET_GB, None
 
 
-# ── Auth ─────────────────────────────────────────────────────────────────────
-
-class User(UserMixin):
-    def __init__(self, row):
-        self.id               = row["id"]
-        self.username         = row["username"]
-        self.is_admin         = bool(row["is_admin"])
-        self.youtube_verified = bool(row["youtube_verified"]) if row["youtube_verified"] is not None else False
+def count_all_vps() -> int:
+    return sum(1 for inst in client.instances.all() if inst.name.startswith("vps-"))
 
 
-@login_manager.user_loader
-def load_user(uid):
-    row = get_db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    return User(row) if row else None
+def can_create_vps():
+    current = count_all_vps()
+    return current < MAX_VPS_PER_NODE, current
 
 
-def generate_recovery_code(length: int = 6) -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+# ── low-level helpers ───────────────────────────────────────────────────────
+
+def _get_container(container_id: str):
+    try:
+        return client.instances.get(container_id)
+    except (LXDNotFound, Exception):
+        return None
+
+
+def _exec(inst, cmd_list: list, environment: dict = None):
+    return inst.execute(cmd_list, environment=environment or {})
+
+
+def _wait_running(inst, timeout: int = 30) -> bool:
+    for _ in range(timeout):
+        inst.sync()
+        if inst.status.lower() == "running":
+            return True
+        time.sleep(1)
+    return False
+
+
+def _set_root_password_with_retry(inst, password: str, attempts: int = 15, delay: int = 2):
+    for _ in range(attempts):
+        try:
+            _exec(inst, ["bash", "-c", f"echo root:{password} | chpasswd"])
+            return
+        except Exception as e:
+            time.sleep(delay)
+
+
+def generate_password(length: int = 16) -> str:
+    alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-# ── Static / landing ─────────────────────────────────────────────────────────
+# ── container lifecycle ─────────────────────────────────────────────────────
 
-@app.route("/bg/<path:filename>")
-def serve_background(filename):
-    return send_from_directory("templates", filename)
+def _create_raw(username: str, cpu: int, ram_mb: int, disk_gb: int, image: str = IMAGE_ALIAS) -> dict:
+    password       = generate_password()
+    container_name = f"vps-{username}-{secrets.token_hex(3)}"
 
-
-@app.route("/")
-def index():
-    if current_user.is_authenticated:
-        return redirect(url_for("dashboard"))
-    return render_template("landing.html")
-
-
-# ── Registration / login / recovery ─────────────────────────────────────────
-
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        u  = request.form.get("username", "").strip()
-        p  = request.form.get("password", "")
-        ip = request.remote_addr
-
-        if not u or not p:
-            return render_template("register.html", error="Fill both fields")
-        if len(p) < 6:
-            return render_template("register.html", error="Password must be ≥6 characters")
-
-        db = get_db()
-        if db.execute("SELECT 1 FROM users WHERE username=?", (u,)).fetchone():
-            return render_template("register.html", error="Username taken")
-
-        is_vpn, vpn_label = ip_intel.is_vpn_or_proxy(ip)
-        db.execute(
-            "INSERT INTO users(username,password,signup_ip,created_at,is_vpn_signup,vpn_provider)"
-            " VALUES(?,?,?,?,?,?)",
-            (u, generate_password_hash(p), ip, int(time.time()), int(is_vpn), vpn_label)
-        )
-        db.commit()
-        return redirect(url_for("login"))
-    return render_template("register.html")
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        u   = request.form.get("username", "").strip()
-        p   = request.form.get("password", "")
-        db  = get_db()
-        row = db.execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
-        if row and check_password_hash(row["password"], p):
-            login_user(User(row), remember=True)
-            if not row["recovery_code_shown"]:
-                code = generate_recovery_code()
-                db.execute(
-                    "UPDATE users SET recovery_code_hash=?, recovery_code_shown=1 WHERE id=?",
-                    (generate_password_hash(code), row["id"])
-                )
-                db.commit()
-                session["show_recovery_code"] = code
-                return redirect(url_for("recovery_code_display"))
-            return redirect(url_for("admin" if row["is_admin"] else "dashboard"))
-        return render_template("login.html", error="Bad credentials")
-    return render_template("login.html")
-
-
-@app.route("/recovery-code")
-@login_required
-def recovery_code_display():
-    code = session.pop("show_recovery_code", None)
-    if not code:
-        return redirect(url_for("dashboard"))
-    return render_template("recovery_code.html", code=code)
-
-
-@app.route("/forgot-password", methods=["GET", "POST"])
-def forgot_password():
-    if request.method == "POST":
-        u    = request.form.get("username", "").strip()
-        code = request.form.get("code", "").strip().upper()
-        db   = get_db()
-        row  = db.execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
-        if not row or not row["recovery_code_hash"] or \
-                not check_password_hash(row["recovery_code_hash"], code):
-            return render_template("forgot_password.html", error="Username and recovery code don't match.")
-        session["reset_user_id"] = row["id"]
-        return redirect(url_for("reset_password"))
-    return render_template("forgot_password.html")
-
-
-@app.route("/reset-password", methods=["GET", "POST"])
-def reset_password():
-    uid = session.get("reset_user_id")
-    if not uid:
-        return redirect(url_for("forgot_password"))
-    if request.method == "POST":
-        pw = request.form.get("password", "")
-        if not pw or len(pw) < 6:
-            return render_template("reset_password.html", error="Password must be ≥6 characters.")
-        db = get_db()
-        db.execute("UPDATE users SET password=? WHERE id=?", (generate_password_hash(pw), uid))
-        db.commit()
-        session.pop("reset_user_id", None)
-        return redirect(url_for("login"))
-    return render_template("reset_password.html")
-
-
-@app.route("/logout", methods=["GET","POST"])
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for("login"))
-
-
-@app.route("/account/delete", methods=["GET", "POST"])
-@login_required
-def delete_account():
-    if request.method == "POST":
-        code = request.form.get("code", "").strip().upper()
-        db   = get_db()
-        row  = db.execute("SELECT * FROM users WHERE id=?", (current_user.id,)).fetchone()
-        if not row or not row["recovery_code_hash"] or \
-                not check_password_hash(row["recovery_code_hash"], code):
-            return render_template("delete_account.html", error="Incorrect recovery code.")
-
-        for v in db.execute("SELECT * FROM vps WHERE user_id=?", (current_user.id,)).fetchall():
-            try:
-                destroy_vps(v["container_id"])
-            except Exception as e:
-                print(f"[DELETE ACCOUNT] Container teardown failed: {e}")
-
-        db.execute("DELETE FROM vps WHERE user_id=?",      (current_user.id,))
-        db.execute("DELETE FROM feedback WHERE user_id=?",  (current_user.id,))
-        db.execute("DELETE FROM users WHERE id=?",          (current_user.id,))
-        db.commit()
-        logout_user()
-        flash("Your account has been permanently deleted.")
-        return redirect(url_for("login"))
-    return render_template("delete_account.html")
-
-
-# ── Dashboard ────────────────────────────────────────────────────────────────
-
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    db      = get_db()
-    all_vps = db.execute(
-        "SELECT * FROM vps WHERE user_id=? ORDER BY created_at ASC",
-        (current_user.id,)
-    ).fetchall()
-
-    selected_id = request.args.get("vps_id", type=int)
-    vps = None
-    if selected_id:
-        vps = next((v for v in all_vps if v["id"] == selected_id), None)
-    if not vps and all_vps:
-        vps = all_vps[0]
-
-    if vps and vps["status"] in ("running", "stopped"):
-        real = sync_status(vps["container_id"], vps["status"])
-        if real != vps["status"]:
-            db.execute("UPDATE vps SET status=? WHERE id=?", (real, vps["id"]))
-            db.commit()
-            vps = db.execute("SELECT * FROM vps WHERE id=?", (vps["id"],)).fetchone()
-
-    feedback_rows = db.execute(
-        "SELECT feedback.*, users.username FROM feedback "
-        "JOIN users ON users.id=feedback.user_id "
-        "ORDER BY feedback.created_at DESC LIMIT 20"
-    ).fetchall()
-
-    queue_pos   = queue.get_position(vps["id"]) if vps and vps["status"] in ("queued", "creating") else 0
-    can_feedback = bool(vps and vps["status"] == "running" and vps["ssh_command"])
-
-    # Per-VPS resource limits for display
-    limits = {
-        "cpu":  get_free_vps_cpu(),
-        "ram":  get_free_vps_ram() // 1024,
-        "disk": get_free_vps_disk(),
+    config = {
+        "name":   container_name,
+        "source": {"type": "image", "alias": image},
+        "config": {
+            "limits.cpu":                            str(cpu),
+            "limits.memory":                         f"{ram_mb}MB",
+            "limits.memory.enforce":                 "hard",
+            "security.nesting":                      "true",
+            "security.privileged":                   "true",
+            "security.syscalls.intercept.mknod":     "true",
+            "security.syscalls.intercept.setxattr":  "true",
+            "linux.kernel_modules":                  "overlay,br_netfilter",
+        },
+        "devices": {
+            "root": {
+                "path": "/",
+                "pool": STORAGE_POOL,
+                "type": "disk",
+                "size": f"{disk_gb}GB",
+            }
+        },
     }
 
-    return render_template(
-        "dashboard.html",
-        vps=vps, all_vps=all_vps,
-        feedback_rows=feedback_rows,
-        queue_pos=queue_pos, slot_seconds=queue.SLOT_SECONDS,
-        can_feedback=can_feedback,
-        limits=limits,
-    )
+    try:
+        inst = client.instances.create(config, wait=True)
+        inst.start(wait=True)
+        if not _wait_running(inst):
+            raise RuntimeError("Container did not reach running state in time")
+        _set_root_password_with_retry(inst, password)
+        return {"container_id": container_name, "password": password, "status": "running"}
+    except LXDAPIException as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
-# ── VPS creation — with node overflow routing ────────────────────────────────
+def _enable_kvm_on_container(inst) -> bool:
+    """
+    Grants a container access to /dev/kvm.
+    Uses lxc CLI directly (same approach as hvm.py) rather than pylxd
+    config mutation to avoid pylxd .save() quirks with raw.lxc and devices.
 
-@app.route("/vps/create", methods=["POST"])
-@login_required
-def vps_create():
-    db = get_db()
-    ip = request.remote_addr
+    Steps (matching hvm.py):
+      1. lxc config set <name> security.nesting true
+      2. lxc config set <name> raw.lxc 'lxc.cgroup2.devices.allow = c 10:232 rwm'
+      3. lxc config device add <name> kvm unix-char path=/dev/kvm
+    """
+    if not _probe_kvm():
+        return False
+    name = inst.name
+    try:
+        # 1. Enable nesting
+        r1 = _subprocess.run(
+            ["lxc", "config", "set", name, "security.nesting", "true"],
+            capture_output=True, text=True, timeout=30
+        )
+        if r1.returncode != 0:
+            print(f"[KVM] nesting set failed on {name}: {r1.stderr.strip()}")
 
-    # One VPS per user (free tier)
-    if db.execute("SELECT 1 FROM vps WHERE user_id=?", (current_user.id,)).fetchone():
-        return "You already have a VPS", 403
-    if db.execute("SELECT 1 FROM vps WHERE creator_ip=?", (ip,)).fetchone():
-        return "This IP already owns a VPS", 403
-    user_row = db.execute("SELECT signup_ip FROM users WHERE id=?", (current_user.id,)).fetchone()
-    if db.execute("SELECT 1 FROM vps WHERE creator_ip=?", (user_row["signup_ip"],)).fetchone():
-        return "Your signup IP already owns a VPS", 403
-
-    is_vpn, vpn_label = ip_intel.is_vpn_or_proxy(ip)
-    if is_vpn:
-        return f"VPN/proxy detected ({vpn_label}) — disable it and try again.", 403
-
-    found_elsewhere, other_url = node_mesh.check_ip_across_mesh(db, ip)
-    if found_elsewhere:
-        return f"This IP already owns a VPS on another node ({other_url})", 403
-
-    # ── Node overflow: if this node is full, create on peer via API ─────────
-    allowed, current_count = can_create_vps()
-    if not allowed:
-        peer_url, peer_secret = node_mesh.get_peer_for_overflow(db)
-        if peer_url and peer_secret:
-            now = int(time.time())
-            cur = db.execute(
-                "INSERT INTO vps(user_id,container_id,creator_ip,created_at,status,node_id)"
-                " VALUES(?,?,?,?,'creating',1)",
-                (current_user.id, "pending-overflow", ip, now)
+        # 2. cgroup2 allow rule — read current raw.lxc first, append only if missing
+        inst.sync()
+        existing = inst.config.get("raw.lxc", "")
+        rule = "lxc.cgroup2.devices.allow = c 10:232 rwm"
+        if rule not in existing:
+            new_raw = (existing.rstrip() + "\n" + rule).strip() if existing else rule
+            r2 = _subprocess.run(
+                ["lxc", "config", "set", name, "raw.lxc", new_raw],
+                capture_output=True, text=True, timeout=30
             )
-            db.commit()
-            vps_id = cur.lastrowid
-            threading.Thread(
-                target=_overflow_build_worker,
-                args=(vps_id, current_user.id, ip, peer_url, peer_secret),
-                daemon=True,
-            ).start()
-            flash(f"This node is full — VPS being created on {peer_url}.")
-            return redirect(url_for("vps_view", vps_id=vps_id))
-        return (
-            "This node is full and no other nodes have capacity right now. "
-            "Please try again later.", 503
+            if r2.returncode != 0:
+                print(f"[KVM] raw.lxc set failed on {name}: {r2.stderr.strip()}")
+
+        # 3. Add /dev/kvm device
+        r3 = _subprocess.run(
+            ["lxc", "config", "device", "add", name,
+             "kvm", "unix-char", "path=/dev/kvm"],
+            capture_output=True, text=True, timeout=30
+        )
+        if r3.returncode != 0 and "already exists" not in r3.stderr:
+            print(f"[KVM] device add failed on {name}: {r3.stderr.strip()}")
+            return False
+
+        print(f"[KVM] /dev/kvm attached to {name}")
+        return True
+    except Exception as e:
+        print(f"[KVM] _enable failed on {name}: {e}")
+        return False
+
+
+def _disable_kvm_on_container(inst) -> bool:
+    """Removes /dev/kvm device and cgroup rule via lxc CLI."""
+    name = inst.name
+    try:
+        # Remove device (ignore error if it doesn't exist)
+        _subprocess.run(
+            ["lxc", "config", "device", "remove", name, "kvm"],
+            capture_output=True, text=True, timeout=30
+        )
+        # Clean cgroup rule from raw.lxc
+        inst.sync()
+        existing = inst.config.get("raw.lxc", "")
+        rule = "lxc.cgroup2.devices.allow = c 10:232 rwm"
+        cleaned = "\n".join(
+            ln for ln in existing.splitlines() if ln.strip() != rule
+        ).strip()
+        if cleaned != existing.strip():
+            _subprocess.run(
+                ["lxc", "config", "set", name, "raw.lxc", cleaned],
+                capture_output=True, text=True, timeout=30
+            )
+        print(f"[KVM] /dev/kvm detached from {name}")
+        return True
+    except Exception as e:
+        print(f"[KVM] _disable failed on {name}: {e}")
+        return False
+
+
+def set_kvm_enabled(container_id: str, enable: bool) -> bool:
+    """
+    Toggles KVM access on a running or stopped container.
+    Called from app.py admin grant-vps / admin vps edit flows.
+    Returns True on success.
+    """
+    inst = _get_container(container_id)
+    if not inst:
+        return False
+    if enable:
+        return _enable_kvm_on_container(inst)
+    return _disable_kvm_on_container(inst)
+
+
+def create_vps_container(
+    username: str,
+    cpu_limit:    int = None,
+    ram_limit_mb: int = None,
+    disk_limit_gb: int = None,
+    image: str = IMAGE_ALIAS,
+    kvm_enabled: bool = False,
+):
+    """
+    High-level entry point used by app.py.
+    Falls back to panel_config limits when individual params are None.
+    kvm_enabled is only honoured when kvm_available() returns True —
+    silently ignored otherwise so the rest of provisioning proceeds.
+    Returns (container_id, sshx_session_url).
+    Raises RuntimeError on any failure.
+    """
+    cpu  = cpu_limit    if cpu_limit    is not None else get_free_vps_cpu()
+    ram  = ram_limit_mb if ram_limit_mb is not None else get_free_vps_ram()
+    disk = disk_limit_gb if disk_limit_gb is not None else get_free_vps_disk()
+
+    allowed, current = can_create_vps()
+    if not allowed:
+        raise RuntimeError(
+            f"Node VPS limit reached ({current}/{MAX_VPS_PER_NODE}). "
+            "No new VPS can be created until existing ones are deleted."
         )
 
-    disk_ok, disk_alloc, disk_budget, disk_msg = can_allocate_disk(get_free_vps_disk())
-    if not disk_ok:
-        return disk_msg or f"Disk budget reached ({disk_alloc}/{disk_budget} GB).", 503
-
-    now        = int(time.time())
-    last_click = _last_create_click.get(ip, 0)
-    if now - last_click < CREATE_DEBOUNCE_SECONDS:
-        return "Please wait a few seconds before trying again.", 429
-    _last_create_click[ip] = now
-
-    cur    = db.execute(
-        "INSERT INTO vps(user_id,container_id,creator_ip,created_at,status) VALUES(?,?,?,?,?)",
-        (current_user.id, "pending", ip, now, "queued")
-    )
-    db.commit()
-    vps_id = cur.lastrowid
-
-    queue.enqueue(current_user.id, vps_id)
-    return redirect(url_for("vps_view", vps_id=vps_id))
-
-
-def _overflow_build_worker(vps_id: int, user_id: int, ip: str,
-                            peer_url: str, peer_secret: str):
-    """
-    Calls the peer node API to build a VPS there, then stores the result
-    (ssh_url from the peer) in our local DB row so the user can see it.
-    """
-    from vps import get_free_vps_cpu, get_free_vps_ram, get_free_vps_disk
-    result = node_mesh.create_vps_on_peer(
-        peer_url=peer_url,
-        shared_secret=peer_secret,
-        my_url=node_mesh.get_node_url(),
-        username=f"vps-{user_id}",
-        cpu=get_free_vps_cpu(),
-        ram_mb=get_free_vps_ram(),
-        disk_gb=get_free_vps_disk(),
-    )
-    db = get_db()
+    result = _create_raw(username, cpu, ram, disk, image)
     if "error" in result:
-        db.execute(
-            "UPDATE vps SET status='failed', ssh_command=?, container_id='overflow-failed' WHERE id=?",
-            (result["error"], vps_id)
-        )
-    else:
-        db.execute(
-            "UPDATE vps SET status='running', container_id=?, ssh_command=? WHERE id=?",
-            (result.get("container_id", "overflow"), result.get("ssh_url", ""), vps_id)
-        )
-    db.commit()
-    db.close()
+        raise RuntimeError(result["error"])
+
+    inst = _get_container(result["container_id"])
+
+    # KVM — attach /dev/kvm before sshx so the device is present at first boot
+    if kvm_enabled and _KVM_AVAILABLE:
+        ok = _enable_kvm_on_container(inst)
+        if not ok:
+            print(f"[KVM] Warning: KVM requested but could not be attached to {result['container_id']}")
+
+    # Install sshx (3 attempts)
+    sshx_ready = any(_install_sshx(inst) or time.sleep(5) for _ in range(3))
+    if not sshx_ready:
+        raise RuntimeError("Could not install sshx after 3 attempts")
+
+    # Start sshx session (3 attempts)
+    session_url = None
+    for _ in range(3):
+        session_url = _start_sshx_session(inst)
+        if session_url:
+            break
+        time.sleep(3)
+
+    if not session_url:
+        raise RuntimeError("sshx installed but session could not be established")
+
+    return result["container_id"], session_url
 
 
-# ── VPS build workers ────────────────────────────────────────────────────────
-
-def _build_vps(vps_id: int, user_id: int):
-    db = get_db()
-    db.execute("UPDATE vps SET status='creating' WHERE id=?", (vps_id,))
-    db.commit()
-    db.close()
-    try:
-        cid, ssh = create_vps_container(f"vps-{user_id}")
-        db = get_db()
-        db.execute(
-            "UPDATE vps SET container_id=?, ssh_command=?, status='running' WHERE id=?",
-            (cid, ssh, vps_id)
-        )
-        db.commit()
-        db.close()
-    except Exception as e:
-        db = get_db()
-        db.execute("UPDATE vps SET status='failed', ssh_command=? WHERE id=?", (str(e), vps_id))
-        db.commit()
-        db.close()
-
-
-def _build_vps_custom(vps_id: int, user_id: int, cpu: int, ram_mb: int, disk_gb: int,
-                      kvm: bool = False):
-    db = get_db()
-    db.execute("UPDATE vps SET status='creating' WHERE id=?", (vps_id,))
-    db.commit()
-    db.close()
-    try:
-        cid, ssh = create_vps_container(
-            f"vps-{user_id}",
-            cpu_limit=cpu,
-            ram_limit_mb=ram_mb,
-            disk_limit_gb=disk_gb,
-            kvm_enabled=kvm,
-        )
-        db = get_db()
-        db.execute(
-            "UPDATE vps SET container_id=?, ssh_command=?, status='running', kvm_enabled=?"
-            " WHERE id=?",
-            (cid, ssh, int(kvm), vps_id)
-        )
-        db.commit()
-        db.close()
-    except Exception as e:
-        db = get_db()
-        db.execute("UPDATE vps SET status='failed', ssh_command=? WHERE id=?", (str(e), vps_id))
-        db.commit()
-        db.close()
-
-
-# ── VPS view / status polling ────────────────────────────────────────────────
-
-@app.route("/vps/<int:vps_id>")
-@login_required
-def vps_view(vps_id):
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
-        return "Not found", 404
-    if vps["status"] in ("running", "stopped"):
-        real = sync_status(vps["container_id"], vps["status"])
-        if real != vps["status"]:
-            db.execute("UPDATE vps SET status=? WHERE id=?", (real, vps_id))
-            db.commit()
-            vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    queue_pos = queue.get_position(vps_id) if vps["status"] in ("queued", "creating") else 0
-    return render_template("vps_view.html", vps=vps, queue_pos=queue_pos, slot_seconds=queue.SLOT_SECONDS)
-
-
-@app.route("/vps/<int:vps_id>/queue_status")
-@login_required
-def vps_queue_status(vps_id):
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
-        return jsonify({"error": "no"}), 404
-    return jsonify({
-        "status":      vps["status"],
-        "position":    queue.get_position(vps_id),
-        "eta_seconds": queue.get_position(vps_id) * queue.SLOT_SECONDS,
-        "ssh_command": vps["ssh_command"],
-    })
-
-
-@app.route("/vps/<int:vps_id>/dismiss", methods=["POST"])
-@login_required
-def vps_dismiss(vps_id):
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps or vps["user_id"] != current_user.id:
-        return "Not found", 404
-    if vps["status"] != "failed":
-        return "Only a failed build can be dismissed", 400
-    db.execute("DELETE FROM vps WHERE id=?", (vps_id,))
-    db.commit()
-    return redirect(url_for("dashboard"))
-
-
-@app.route("/vps/<int:vps_id>/logs")
-@login_required
-def vps_logs(vps_id):
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
-        return "Not found", 404
-
-    @stream_with_context
-    def gen():
-        cid, waited = vps["container_id"], 0
-        while cid == "pending" and waited < 600:
-            time.sleep(2); waited += 2
-            row = get_db().execute(
-                "SELECT container_id, status FROM vps WHERE id=?", (vps_id,)
-            ).fetchone()
-            if not row:
-                yield "data: VPS record gone.\n\n"; yield "data: [DONE]\n\n"; return
-            cid = row["container_id"]
-            if row["status"] == "failed":
-                yield f"data: Build failed: {cid}\n\n"; yield "data: [DONE]\n\n"; return
-        if cid == "pending":
-            yield "data: Build taking too long.\n\n"; yield "data: [DONE]\n\n"; return
-        for line in build_logs_stream(cid):
-            yield f"data: {line}\n\n"
-        yield "data: [DONE]\n\n"
-
-    return Response(gen(), mimetype="text/event-stream")
-
-
-@app.route("/vps/<int:vps_id>/stats")
-@login_required
-def vps_stats(vps_id):
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
-        return jsonify({"error": "no"}), 404
-    if vps["status"] != "running":
-        return jsonify({"error": "not running", "status": vps["status"]})
-    try:
-        return jsonify(get_container_stats(vps["container_id"], vps["created_at"]))
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-
-@app.route("/vps/<int:vps_id>/regen_ssh", methods=["POST"])
-@login_required
-def regen_ssh(vps_id):
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps:
-        flash("VPS not found"); return redirect(url_for("dashboard"))
-    if vps["user_id"] != current_user.id and not current_user.is_admin:
-        flash("Not your VPS");  return redirect(url_for("dashboard"))
-    if vps["status"] != "running":
-        flash("VPS must be running"); return redirect(url_for("vps_view", vps_id=vps_id))
-    if time.time() - vps["last_regen"] < 30:
-        flash("Wait 30s between regens"); return redirect(url_for("vps_view", vps_id=vps_id))
-    try:
-        new_url = regen_sshx(vps["container_id"])
-        if not new_url:
-            flash("Could not start a new terminal session")
-            return redirect(url_for("vps_view", vps_id=vps_id))
-        db.execute("UPDATE vps SET ssh_command=?, last_regen=? WHERE id=?",
-                   (new_url, int(time.time()), vps_id))
-        db.commit()
-        flash("New terminal link generated")
-    except Exception as e:
-        flash(f"Failed to regenerate: {e}")
-    return redirect(url_for("vps_view", vps_id=vps_id))
-
-
-@app.route("/vps/<int:vps_id>/power/<action>", methods=["POST"])
-@login_required
-def vps_power(vps_id, action):
-    if action not in ("start", "stop", "reinstall"):
-        return "Unknown action", 400
-
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps:
-        flash("VPS not found"); return redirect(url_for("dashboard"))
-    if vps["user_id"] != current_user.id and not current_user.is_admin:
-        flash("Not your VPS"); return redirect(url_for("dashboard"))
-
-    if vps["status"] in ("running", "stopped"):
-        real = sync_status(vps["container_id"], vps["status"])
-        if real != vps["status"]:
-            db.execute("UPDATE vps SET status=? WHERE id=?", (real, vps_id))
-            db.commit()
-            vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-
-    debounce = REINSTALL_DEBOUNCE_SECONDS if action == "reinstall" else POWER_DEBOUNCE_SECONDS
-    now      = time.time()
-    if now - _last_power_action.get(vps_id, 0) < debounce:
-        flash("Please wait before trying that again.")
-        return redirect(url_for("dashboard", vps_id=vps_id))
-    _last_power_action[vps_id] = now
-
-    if action == "start":
-        if vps["status"] != "stopped":
-            flash("VPS must be stopped to start it")
-            return redirect(url_for("dashboard", vps_id=vps_id))
-        try:
-            result = start_vps(vps["container_id"])
-            if "error" in result:
-                flash(f"Failed: {result['error']}")
-            else:
-                db.execute("UPDATE vps SET status='running' WHERE id=?", (vps_id,))
-                db.commit(); flash("VPS started")
-        except Exception as e:
-            flash(f"Failed: {e}")
-
-    elif action == "stop":
-        if vps["status"] != "running":
-            flash("VPS must be running to stop it")
-            return redirect(url_for("dashboard", vps_id=vps_id))
-        try:
-            result = stop_vps(vps["container_id"])
-            if "error" in result:
-                flash(f"Failed: {result['error']}")
-            else:
-                db.execute("UPDATE vps SET status='stopped' WHERE id=?", (vps_id,))
-                db.commit(); flash("VPS stopped")
-        except Exception as e:
-            flash(f"Failed: {e}")
-
-    elif action == "reinstall":
-        if vps["status"] not in ("running", "stopped", "failed"):
-            flash("VPS can't be reinstalled while building")
-            return redirect(url_for("dashboard", vps_id=vps_id))
-        db.execute("UPDATE vps SET status='creating', ssh_command=NULL WHERE id=?", (vps_id,))
-        db.commit()
-        had_kvm = bool(vps["kvm_enabled"]) if "kvm_enabled" in vps.keys() else False
-        threading.Thread(
-            target=_reinstall_worker,
-            args=(vps_id, vps["container_id"], f"vps-{vps['user_id']}"),
-            kwargs={"kvm": had_kvm},
-            daemon=True,
-        ).start()
-        flash("Reinstalling your VPS — takes a minute or two.")
-
-    return redirect(url_for("dashboard", vps_id=vps_id))
-
-
-def _reinstall_worker(vps_id: int, old_cid: str, username: str, kvm: bool = False):
-    try:
-        new_cid, new_ssh = reinstall_vps(old_cid, username, kvm_enabled=kvm)
-        db = get_db()
-        db.execute(
-            "UPDATE vps SET container_id=?, ssh_command=?, status='running', kvm_enabled=?"
-            " WHERE id=?",
-            (new_cid, new_ssh, int(kvm), vps_id)
-        )
-        db.commit(); db.close()
-    except Exception as e:
-        db = get_db()
-        db.execute("UPDATE vps SET status='failed', ssh_command=? WHERE id=?", (str(e), vps_id))
-        db.commit(); db.close()
-
-
-# ── In-browser terminal (exec endpoint) ─────────────────────────────────────
-
-@app.route("/vps/<int:vps_id>/terminal/exec", methods=["POST"])
-@login_required
-def terminal_exec(vps_id):
-    """
-    One-shot command execution for the in-page terminal.
-    POST JSON: {"cmd": "ls -la /root"}
-    Returns JSON: {"output": "...", "exit_code": 0}
-    """
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
-        return jsonify({"error": "not found"}), 404
-    if vps["status"] != "running":
-        return jsonify({"error": "VPS is not running"}), 400
-
-    data = request.get_json(silent=True) or {}
-    cmd  = data.get("cmd", "").strip()
-    if not cmd:
-        return jsonify({"error": "no command"}), 400
-
-    # Very simple guard — block the most obviously dangerous single-shot cmds
-    blocked = ["rm -rf /", "mkfs", "> /dev/sda", "dd if="]
-    if any(b in cmd for b in blocked):
-        return jsonify({"output": "Command blocked.", "exit_code": 1})
-
-    try:
-        result = exec_command(vps["container_id"], cmd)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ── File manager API ─────────────────────────────────────────────────────────
-
-def _get_owned_vps(vps_id: int):
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
+def get_vps_specs(container_id: str) -> dict | None:
+    inst = _get_container(container_id)
+    if not inst:
         return None
-    return vps
-
-
-@app.route("/vps/<int:vps_id>/files")
-@login_required
-def file_manager(vps_id):
-    vps = _get_owned_vps(vps_id)
-    if not vps:
-        abort(404)
-    if vps["status"] != "running":
-        flash("VPS must be running to use the file manager")
-        return redirect(url_for("dashboard"))
-    path = request.args.get("path", "/root")
     try:
-        entries = list_files(vps["container_id"], path)
-    except Exception as e:
-        entries = []
-        flash(str(e))
-    return render_template("file_manager.html", vps=vps, path=path, entries=entries)
-
-
-@app.route("/vps/<int:vps_id>/files/download")
-@login_required
-def file_download(vps_id):
-    vps = _get_owned_vps(vps_id)
-    if not vps:
-        abort(404)
-    path = request.args.get("path", "")
-    if not path:
-        return "No path specified", 400
-    try:
-        b64 = read_file_b64(vps["container_id"], path)
-        raw = base64.b64decode(b64)
-        filename = path.split("/")[-1] or "file"
-        return Response(
-            raw,
-            mimetype="application/octet-stream",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-    except Exception as e:
-        return str(e), 500
-
-
-@app.route("/vps/<int:vps_id>/files/upload", methods=["POST"])
-@login_required
-def file_upload(vps_id):
-    vps = _get_owned_vps(vps_id)
-    if not vps:
-        abort(404)
-    if vps["status"] != "running":
-        return "VPS not running", 400
-
-    dest_path = request.form.get("path", "/root")
-    file      = request.files.get("file")
-    if not file or not file.filename:
-        flash("No file selected")
-        return redirect(url_for("file_manager", vps_id=vps_id, path=dest_path))
-
-    filename  = file.filename.replace(" ", "_")
-    b64_data  = base64.b64encode(file.read()).decode()
-    full_path = dest_path.rstrip("/") + "/" + filename
-
-    try:
-        write_file_b64(vps["container_id"], full_path, b64_data)
-        flash(f"Uploaded {filename}")
-    except Exception as e:
-        flash(f"Upload failed: {e}")
-
-    return redirect(url_for("file_manager", vps_id=vps_id, path=dest_path))
-
-
-@app.route("/vps/<int:vps_id>/files/delete", methods=["POST"])
-@login_required
-def file_delete(vps_id):
-    vps = _get_owned_vps(vps_id)
-    if not vps:
-        abort(404)
-    path      = request.form.get("path", "")
-    back_path = request.form.get("back", "/root")
-    if not path:
-        return "No path specified", 400
-    try:
-        delete_file(vps["container_id"], path)
-        flash(f"Deleted {path}")
-    except Exception as e:
-        flash(f"Delete failed: {e}")
-    return redirect(url_for("file_manager", vps_id=vps_id, path=back_path))
-
-
-@app.route("/vps/<int:vps_id>/files/mkdir", methods=["POST"])
-@login_required
-def file_mkdir(vps_id):
-    vps = _get_owned_vps(vps_id)
-    if not vps:
-        abort(404)
-    base = request.form.get("base", "/root")
-    name = request.form.get("name", "").strip()
-    if not name:
-        flash("Folder name required")
-        return redirect(url_for("file_manager", vps_id=vps_id, path=base))
-    full = base.rstrip("/") + "/" + name
-    try:
-        create_directory(vps["container_id"], full)
-        flash(f"Created {full}")
-    except Exception as e:
-        flash(f"Failed: {e}")
-    return redirect(url_for("file_manager", vps_id=vps_id, path=base))
-
-
-# ── Feedback ──────────────────────────────────────────────────────────────────
-
-@app.route("/feedback", methods=["POST"])
-@login_required
-def submit_feedback():
-    db  = get_db()
-    vps = db.execute(
-        "SELECT * FROM vps WHERE user_id=? AND status='running' AND ssh_command IS NOT NULL LIMIT 1",
-        (current_user.id,)
-    ).fetchone()
-    if not vps:
-        return "Need a running VPS with terminal access to leave feedback", 403
-    try:
-        stars = int(request.form.get("stars", 0))
-    except ValueError:
-        stars = 0
-    if not (1 <= stars <= 5):
-        return "Stars must be 1–5", 400
-    comment = request.form.get("comment", "").strip()[:500]
-    db.execute("INSERT INTO feedback(user_id,stars,comment,created_at) VALUES(?,?,?,?)",
-               (current_user.id, stars, comment, int(time.time())))
-    db.commit()
-    return redirect(url_for("dashboard"))
-
-
-# ── Admin ─────────────────────────────────────────────────────────────────────
-
-@app.route("/admin")
-@login_required
-def admin():
-    if not current_user.is_admin:
-        return "Forbidden", 403
-    db   = get_db()
-    rows = db.execute(
-        "SELECT vps.*, users.username FROM vps JOIN users ON users.id=vps.user_id"
-    ).fetchall()
-    users = db.execute(
-        "SELECT id,username,signup_ip,is_admin,created_at,recovery_code_shown,"
-        "is_vpn_signup,vpn_provider FROM users"
-    ).fetchall()
-    queue_entries = queue.peek_all()
-    host          = get_host_capacity()
-    broadcast     = db.execute("SELECT message, active FROM broadcast WHERE id=1").fetchone()
-    config_row    = {
-        r["key"]: r["value"]
-        for r in db.execute("SELECT key,value FROM panel_config").fetchall()
-    }
-    return render_template(
-        "admin.html",
-        vpses=rows, users=users,
-        queue_length=queue.queue_length(), queue_entries=queue_entries,
-        host=host, broadcast=broadcast, config=config_row,
-        max_vps=MAX_VPS_PER_NODE,
-        node_code=node_mesh.NODE_CODE,
-        node_url=node_mesh.get_node_url(),
-        host_kvm=kvm_available(),   # admin.html gates the KVM grant checkbox on this
-    )
-
-
-@app.route("/admin/config", methods=["POST"])
-@login_required
-def admin_update_config():
-    if not current_user.is_admin:
-        return "Forbidden", 403
-    db = get_db()
-    for key in ("vps_cpu_cores", "vps_ram_gb", "vps_disk_gb"):
-        val = request.form.get(key, "").strip()
-        if val.isdigit() and int(val) > 0:
-            db.execute(
-                "INSERT INTO panel_config(key,value) VALUES(?,?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, val)
-            )
-    db.commit()
-    flash("Resource limits updated")
-    return redirect(url_for("admin"))
-
-
-@app.route("/admin/broadcast", methods=["POST"])
-@login_required
-def admin_broadcast_set():
-    if not current_user.is_admin:
-        return "Forbidden", 403
-    message = request.form.get("message", "").strip()[:500]
-    if not message:
-        flash("Message can't be empty"); return redirect(url_for("admin"))
-    db = get_db()
-    db.execute("UPDATE broadcast SET message=?, active=1, updated_at=? WHERE id=1",
-               (message, int(time.time())))
-    db.commit()
-    flash("Message posted")
-    return redirect(url_for("admin"))
-
-
-@app.route("/admin/broadcast/clear", methods=["POST"])
-@login_required
-def admin_broadcast_clear():
-    if not current_user.is_admin:
-        return "Forbidden", 403
-    get_db().execute("UPDATE broadcast SET active=0 WHERE id=1")
-    get_db().commit()
-    flash("Message cleared")
-    return redirect(url_for("admin"))
-
-
-@app.route("/admin/grant-vps", methods=["POST"])
-@login_required
-def admin_grant_vps():
-    if not current_user.is_admin:
-        return "Forbidden", 403
-    db       = get_db()
-    username = request.form.get("username", "").strip()
-    try:
-        ram_gb     = int(request.form.get("ram_gb", 0))
-        cpu_cores  = int(request.form.get("cpu_cores", 0))
-        disk_gb    = int(request.form.get("disk_gb", 0))
-    except ValueError:
-        return "RAM/CPU/Disk must be numbers", 400
-
-    # KVM: only accepted when the host actually has /dev/kvm
-    want_kvm   = bool(request.form.get("kvm_enabled")) and kvm_available()
-
-    if not username:                                return "Username required", 400
-    if not (1 <= ram_gb    <= ADMIN_MAX_RAM_GB):    return f"RAM must be 1–{ADMIN_MAX_RAM_GB} GB", 400
-    if not (1 <= cpu_cores <= ADMIN_MAX_CPU_CORES): return f"CPU must be 1–{ADMIN_MAX_CPU_CORES}", 400
-    if not (1 <= disk_gb   <= ADMIN_MAX_DISK_GB):   return f"Disk must be 1–{ADMIN_MAX_DISK_GB} GB", 400
-
-    host = get_host_capacity()
-    if cpu_cores > host["cpu_cores"]:
-        return f"Host only has {host['cpu_cores']} cores.", 400
-    if ram_gb * 1024 > host["ram_mb"]:
-        return f"Host only has {host['ram_mb']//1024}GB RAM.", 400
-
-    disk_ok, disk_alloc, disk_budget, disk_msg = can_allocate_disk(disk_gb)
-    if not disk_ok:
-        return disk_msg or f"Disk budget reached ({disk_alloc}/{disk_budget} GB).", 400
-
-    target = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-    if not target:
-        return "No user with that username", 404
-
-    allowed, _ = can_create_vps()
-    if not allowed:
-        return "Node full", 503
-
-    cur    = db.execute(
-        "INSERT INTO vps(user_id,container_id,creator_ip,created_at,status,kvm_enabled)"
-        " VALUES(?,?,?,?,?,?)",
-        (target["id"], "pending", "admin-grant", int(time.time()), "creating", int(want_kvm))
-    )
-    db.commit()
-    vps_id = cur.lastrowid
-
-    threading.Thread(
-        target=_build_vps_custom,
-        args=(vps_id, target["id"], cpu_cores, ram_gb * 1024, disk_gb, want_kvm),
-        daemon=True,
-    ).start()
-
-    flash(f"VPS creation started for {username}" + (" (KVM enabled)" if want_kvm else ""))
-    return redirect(url_for("admin"))
-
-
-@app.route("/admin/vps/<int:vps_id>/<action>", methods=["POST"])
-@login_required
-def admin_vps_action(vps_id, action):
-    if not current_user.is_admin:
-        return "Forbidden", 403
-    db  = get_db()
-    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
-    if not vps:
-        return "Not found", 404
-
-    if action == "suspend":
-        suspend_vps(vps["container_id"])
-        db.execute("UPDATE vps SET status='suspended' WHERE id=?", (vps_id,))
-
-    elif action == "unsuspend":
-        unsuspend_vps(vps["container_id"])
-        db.execute("UPDATE vps SET status='running' WHERE id=?", (vps_id,))
-
-    elif action == "delete":
-        destroy_vps(vps["container_id"])
-        db.execute("DELETE FROM vps WHERE id=?", (vps_id,))
-
-    elif action in ("enable_kvm", "disable_kvm"):
-        # KVM toggle — only meaningful when the host supports it
-        if not kvm_available():
-            flash("KVM is not available on this host (/dev/kvm missing).")
-            return redirect(url_for("admin"))
-        enable = action == "enable_kvm"
-        ok     = set_kvm_enabled(vps["container_id"], enable)
-        if ok:
-            db.execute("UPDATE vps SET kvm_enabled=? WHERE id=?", (int(enable), vps_id))
-            flash(f"KVM {'enabled' if enable else 'disabled'} for VPS {vps['container_id'][:12]}.")
-        else:
-            flash("KVM toggle failed — check server logs.")
-        db.commit()
-        return redirect(url_for("admin"))
-
-    db.commit()
-    return redirect(url_for("admin"))
-
-
-# ── Admin — nodes tab ─────────────────────────────────────────────────────────
-
-@app.route("/admin/nodes", methods=["GET", "POST"])
-@login_required
-def admin_nodes():
-    if not current_user.is_admin:
-        return "Forbidden", 403
-    db     = get_db()
-    result = None
-    if request.method == "POST":
-        remote_url  = request.form.get("remote_url",  "").strip()
-        remote_code = request.form.get("remote_code", "").strip()
-        if not remote_url or not remote_code:
-            result = (False, "Enter both the remote node URL and its code.")
-        else:
-            result = node_mesh.pair_with_node(db, remote_url, remote_code)
-    nodes = node_mesh.list_nodes(db)
-    now   = int(time.time())
-    return render_template(
-        "admin_nodes.html",
-        nodes=nodes, result=result,
-        my_code=node_mesh.NODE_CODE,
-        my_url=node_mesh.get_node_url(),
-        max_vps=MAX_VPS_PER_NODE,
-        now=now,
-    )
-
-
-@app.route("/admin/nodes/<int:node_id>/remove", methods=["POST"])
-@login_required
-def admin_node_remove(node_id):
-    if not current_user.is_admin:
-        return "Forbidden", 403
-    db = get_db()
-    db.execute("DELETE FROM nodes WHERE id=?", (node_id,))
-    db.commit()
-    flash("Node removed")
-    return redirect(url_for("admin_nodes"))
-
-
-# ── Mesh API — called by other nodes ─────────────────────────────────────────
-
-@app.route("/api/node/pair", methods=["POST"])
-def api_node_pair():
-    """
-    Another node POSTs here with Authorization: <this_node's_code>
-    and JSON body {"my_url": "<their url>"}.
-    """
-    code          = request.headers.get("Authorization", "")
-    data          = request.get_json(silent=True) or {}
-    requester_url = data.get("my_url", "")
-    db            = get_db()
-    ok, result    = node_mesh.accept_pairing(db, code, requester_url)
-    if not ok:
-        return jsonify({"error": result}), 403
-    return jsonify({"shared_secret": result})
-
-
-@app.route("/api/node/check_ip", methods=["POST"])
-def api_node_check_ip():
-    """
-    Paired node POSTs here with Authorization: <shared_secret>
-    and JSON body {"ip": "..."}.
-    """
-    db         = get_db()
-    peer_url   = request.headers.get("X-Node-Url", "")
-    secret     = request.headers.get("Authorization", "")
-    if not node_mesh.verify_peer_secret(db, peer_url, secret):
-        return jsonify({"error": "unauthorized"}), 403
-
-    data = request.get_json(silent=True) or {}
-    ip   = data.get("ip", "")
-    if not ip:
-        return jsonify({"error": "missing ip"}), 400
-
-    has_vps = bool(db.execute("SELECT 1 FROM vps WHERE creator_ip=?", (ip,)).fetchone())
-    if not has_vps:
-        has_vps = bool(db.execute(
-            "SELECT 1 FROM vps JOIN users ON users.id=vps.user_id WHERE users.signup_ip=?", (ip,)
-        ).fetchone())
-    return jsonify({"has_vps": has_vps})
-
-
-@app.route("/api/node/stats", methods=["POST"])
-def api_node_stats():
-    """
-    Paired node POSTs its current stats here every 60s so our nodes table
-    stays fresh for the admin nodes view.
-    """
-    db       = get_db()
-    peer_url = request.headers.get("X-Node-Url", "")
-    secret   = request.headers.get("Authorization", "")
-    if not node_mesh.verify_peer_secret(db, peer_url, secret):
-        return jsonify({"error": "unauthorized"}), 403
-
-    data = request.get_json(silent=True) or {}
-    node_mesh.update_peer_stats(
-        db,
-        peer_url=peer_url,
-        vps_count=data.get("vps_count", 0),
-        cpu_cores=data.get("cpu_cores", 0),
-        ram_mb=data.get("ram_mb", 0),
-        disk_gb=data.get("disk_gb", 0),
-    )
-    return jsonify({"ok": True})
-
-@app.route("/api/node/create_vps", methods=["POST"])
-def api_node_create_vps():
-    """
-    Overflow VPS creation endpoint.
-    Another node POSTs here when it is full and wants us to build a VPS.
-    Authorization: <shared_secret>  X-Node-Url: <their url>
-    Body: {username, cpu, ram_mb, disk_gb, origin_url}
-    Returns: {container_id, ssh_url} or {error}
-    """
-    db       = get_db()
-    peer_url = request.headers.get("X-Node-Url", "")
-    secret   = request.headers.get("Authorization", "")
-    if not node_mesh.verify_peer_secret(db, peer_url, secret):
-        return jsonify({"error": "unauthorized"}), 403
-
-    data = request.get_json(silent=True) or {}
-    username = data.get("username", "overflow-user")
-    cpu      = int(data.get("cpu",     get_free_vps_cpu()))
-    ram_mb   = int(data.get("ram_mb",  get_free_vps_ram()))
-    disk_gb  = int(data.get("disk_gb", get_free_vps_disk()))
-
-    allowed, _ = can_create_vps()
-    if not allowed:
-        return jsonify({"error": "This node is also full"}), 503
-
-    try:
-        cid, ssh_url = create_vps_container(
-            username, cpu_limit=cpu, ram_limit_mb=ram_mb, disk_limit_gb=disk_gb
-        )
-        return jsonify({"container_id": cid, "ssh_url": ssh_url})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/node/bootstrap_status")
-@login_required
-def api_bootstrap_status():
-    """Returns bootstrap log lines for a peer node (admin only, for the nodes tab)."""
-    if not current_user.is_admin:
-        return jsonify({"error": "forbidden"}), 403
-    peer_url = request.args.get("url", "").strip()
-    if not peer_url:
-        return jsonify({"error": "missing url"}), 400
-    logs = node_mesh.get_bootstrap_logs(peer_url)
-    return jsonify({"logs": logs, "done": any("complete" in l.lower() or "error" in l.lower() for l in logs[-3:])})
-
-
-# ── Notifications ─────────────────────────────────────────────────────────────
-
-@app.route("/api/notifications/latest")
-@login_required
-def api_notifications_latest():
-    since = request.args.get("since", type=int, default=0)
-    db    = get_db()
-    rows  = db.execute(
-        "SELECT id,message,created_at FROM notifications WHERE created_at>? "
-        "ORDER BY created_at ASC LIMIT 20",
-        (since,)
-    ).fetchall()
-    return jsonify({"notifications": [dict(r) for r in rows], "now": int(time.time())})
-
-
-# ── Startup ───────────────────────────────────────────────────────────────────
-
-
-@app.route("/vps/stats_summary")
-@login_required
-def vps_stats_summary():
-    """Quick count of VPSes on this node for the nodes admin tab."""
-    if not current_user.is_admin:
-        return jsonify({"error":"forbidden"}), 403
-    db  = get_db()
-    cnt = db.execute("SELECT COUNT(*) FROM vps WHERE status NOT IN ('failed','deleted')").fetchone()[0]
-    return jsonify({"vps_count": cnt, "max": MAX_VPS_PER_NODE})
-
-
-@app.template_filter('strftime')
-def strftime_filter(ts):
-    try:
-        return datetime.datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M')
+        cpu  = int(inst.config.get("limits.cpu", "4"))
     except Exception:
-        return str(ts)
-import datetime
+        cpu  = 4
+    ram_raw = inst.config.get("limits.memory", f"{get_free_vps_ram()}MB")
+    try:
+        num = int("".join(c for c in ram_raw if c.isdigit()) or 0)
+        ram = num  # already in MB
+    except Exception:
+        ram = get_free_vps_ram()
+    disk = _quota_gb(inst) or get_free_vps_disk()
+    return {"cpu_cores": cpu, "ram_mb": ram, "disk_gb": disk}
 
-if __name__ == "__main__":
-    init_db()
-    print("=" * 55)
-    print(f"  NODE CODE : {node_mesh.NODE_CODE}")
-    print("  Share this with another node admin to pair nodes.")
-    print("  URL is auto-detected from the first incoming request.")
-    print("=" * 55)
-    start_monitor()
-    queue.start_queue_worker(_build_vps)
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+
+def reinstall_vps(container_id: str, username: str, kvm_enabled: bool = False):
+    specs = get_vps_specs(container_id) or {
+        "cpu_cores": get_free_vps_cpu(),
+        "ram_mb":    get_free_vps_ram(),
+        "disk_gb":   get_free_vps_disk(),
+    }
+    try:
+        destroy_vps(container_id)
+    except Exception:
+        pass
+    return create_vps_container(
+        username,
+        cpu_limit=specs["cpu_cores"],
+        ram_limit_mb=specs["ram_mb"],
+        disk_limit_gb=specs["disk_gb"],
+        kvm_enabled=kvm_enabled,
+    )
+
+
+def destroy_vps(container_id: str) -> dict:
+    inst = _get_container(container_id)
+    if not inst:
+        return {"error": "not found"}
+    try:
+        if inst.status.lower() == "running":
+            inst.stop(wait=True, timeout=10)
+    except Exception:
+        pass
+    inst.delete(wait=True)
+    return {"status": "deleted"}
+
+
+def start_vps(container_id: str) -> dict:
+    inst = _get_container(container_id)
+    if not inst:
+        return {"error": "not found"}
+    inst.start(wait=True)
+    return {"status": "started"}
+
+
+def stop_vps(container_id: str) -> dict:
+    inst = _get_container(container_id)
+    if not inst:
+        return {"error": "not found"}
+    inst.stop(wait=True, timeout=10)
+    return {"status": "stopped"}
+
+
+def suspend_vps(container_id: str) -> dict:
+    inst = _get_container(container_id)
+    if not inst:
+        return {"error": "not found"}
+    try:
+        inst.freeze(wait=True)
+    except Exception:
+        inst.stop(wait=True, timeout=10)
+    return {"status": "suspended"}
+
+
+def unsuspend_vps(container_id: str) -> dict:
+    inst = _get_container(container_id)
+    if not inst:
+        return {"error": "not found"}
+    inst.sync()
+    try:
+        if inst.status.lower() == "frozen":
+            inst.unfreeze(wait=True)
+        else:
+            inst.start(wait=True)
+    except Exception as e:
+        return {"error": str(e)}
+    return {"status": "running"}
+
+
+def get_vps_status(container_id: str) -> dict:
+    inst = _get_container(container_id)
+    if not inst:
+        return {"status": "not_found"}
+    inst.sync()
+    return {"status": inst.status.lower(), "name": inst.name}
+
+
+def sync_status(container_id: str, db_status: str) -> str:
+    if db_status not in ("running", "stopped"):
+        return db_status
+    real = get_vps_status(container_id).get("status", db_status)
+    return real if real in ("running", "stopped") else db_status
+
+
+# ── sshx ───────────────────────────────────────────────────────────────────
+
+def _install_sshx(inst) -> bool:
+    env = {"HOME": "/root", "DEBIAN_FRONTEND": "noninteractive"}
+    find_cmd = (
+        "command -v sshx || "
+        "for p in /root/.local/bin/sshx /usr/local/bin/sshx /usr/bin/sshx; do "
+        "  [ -x \"$p\" ] && echo \"$p\" && break; done"
+    )
+    try:
+        check = _exec(inst, ["bash", "-c", find_cmd], environment=env)
+        found = (check.stdout or "").strip()
+        if found:
+            _ensure_symlinked(inst, found, env)
+            return True
+
+        curl_ok = _exec(inst, ["bash", "-c", "command -v curl"], environment=env)
+        if not (curl_ok.stdout or "").strip():
+            if not _apt_install_with_retry(inst, "curl", env):
+                return False
+
+        install_cmd = (
+            "curl --retry 3 --retry-delay 2 --retry-connrefused "
+            "--connect-timeout 10 -sSf https://sshx.io/get | sh"
+        )
+        for attempt in range(3):
+            result = _exec(inst, ["bash", "-c", install_cmd], environment=env)
+            if result.exit_code == 0:
+                break
+            time.sleep(2)
+
+        check2 = _exec(inst, ["bash", "-c", find_cmd], environment=env)
+        found  = (check2.stdout or "").strip()
+        if not found:
+            return False
+        _ensure_symlinked(inst, found, env)
+        return True
+    except Exception as e:
+        print(f"[sshx install] {e}")
+        return False
+
+
+def _ensure_symlinked(inst, found_path: str, env: dict):
+    if found_path == "/usr/local/bin/sshx":
+        return
+    try:
+        _exec(inst, ["bash", "-c", f"ln -sf '{found_path}' /usr/local/bin/sshx"], environment=env)
+    except Exception:
+        pass
+
+
+def _apt_install_with_retry(inst, package: str, env: dict, attempts: int = 5) -> bool:
+    wait_lock = (
+        "for i in $(seq 1 30); do "
+        "  fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 1; done"
+    )
+    for _ in range(attempts):
+        _exec(inst, ["bash", "-c", wait_lock], environment=env)
+        result = _exec(
+            inst, ["bash", "-c", f"apt-get update -qq && apt-get install -y -qq {package}"],
+            environment=env,
+        )
+        if result.exit_code == 0:
+            return True
+        time.sleep(4)
+    return False
+
+
+def _start_sshx_session(inst) -> str | None:
+    try:
+        _exec(inst, ["bash", "-c", "pkill sshx 2>/dev/null; rm -f /tmp/sshx.log; true"])
+        _exec(inst, ["bash", "-c",
+                     "NO_COLOR=1 TERM=dumb nohup sshx > /tmp/sshx.log 2>&1 < /dev/null & disown"])
+        for _ in range(10):
+            time.sleep(1)
+            result    = _exec(inst, ["bash", "-c", "cat /tmp/sshx.log 2>/dev/null || true"])
+            clean_log = ANSI_ESCAPE_RE.sub("", result.stdout or "")
+            match     = SSHX_LINK_RE.search(clean_log)
+            if match:
+                return match.group(0)
+        return None
+    except Exception as e:
+        print(f"[sshx session] {e}")
+        return None
+
+
+def regen_sshx(container_id: str) -> str | None:
+    inst = _get_container(container_id)
+    if not inst:
+        raise RuntimeError("Container not found")
+    return _start_sshx_session(inst)
+
+
+# ── stats ───────────────────────────────────────────────────────────────────
+
+_cpu_sample_cache: dict = {}
+
+
+def get_container_stats(container_id: str, created_at: int = None) -> dict:
+    inst = _get_container(container_id)
+    if not inst:
+        raise RuntimeError("Container not found")
+
+    inst.sync()
+    raw = inst.state()
+
+    mem_usage       = raw.memory.get("usage", 0) if raw.memory else 0
+    mem_limit_bytes = 0
+    try:
+        cfg = inst.config.get("limits.memory", "0MB")
+        num = int("".join(c for c in cfg if c.isdigit()) or 0)
+        mem_limit_bytes = num * 1024 * 1024
+    except Exception:
+        pass
+
+    try:
+        num_cpus = int(inst.config.get("limits.cpu", "1"))
+    except Exception:
+        num_cpus = 1
+
+    cpu_ns_now = raw.cpu.get("usage", 0) if raw.cpu else 0
+    t_now      = time.time()
+    cpu_pct    = 0.0
+    prev       = _cpu_sample_cache.get(container_id)
+    if prev:
+        cpu_ns_prev, t_prev = prev
+        elapsed_ns          = (t_now - t_prev) * 1e9
+        cpu_delta_ns        = cpu_ns_now - cpu_ns_prev
+        if elapsed_ns > 0 and cpu_delta_ns >= 0:
+            cpu_pct = (cpu_delta_ns / (elapsed_ns * num_cpus)) * 100.0
+
+    _cpu_sample_cache[container_id] = (cpu_ns_now, t_now)
+    mem_pct    = (mem_usage / mem_limit_bytes * 100.0) if mem_limit_bytes else 0.0
+    uptime_sec = int(time.time() - created_at) if created_at else None
+
+    return {
+        "cpu_percent":   round(cpu_pct, 2),
+        "mem_usage_mb":  round(mem_usage / (1024 * 1024), 1),
+        "mem_limit_mb":  round(mem_limit_bytes / (1024 * 1024), 1),
+        "mem_percent":   round(mem_pct, 2),
+        "uptime_seconds": uptime_sec,
+    }
+
+
+# ── mining detection ────────────────────────────────────────────────────────
+
+_SAFE_PROCS = [
+    "sshx", "sshd", "systemd", "systemd-journald", "systemd-logind",
+    "apt", "apt-get", "dpkg", "unattended-upgrade", "cron", "bash",
+    "python3", "app.py", "monitor.py", "vps.py", "gunicorn", "flask",
+    "init", "dbus-daemon", "rsyslogd", "networkd-dispatcher",
+]
+
+_MINER_SIGS = [
+    "xmrig", "xmr-stak", "cpuminer", "minerd", "cryptonight",
+    "nicehash", "ethminer", "t-rex", "lolminer", "phoenixminer",
+    "srbminer", "teamredminer", "unmineable", "kdevtmpfsi", "kinsing",
+]
+
+_MINER_PORTS = ["3333", "4444", "5555", "7777", "8080", "9999", "14444", "45700"]
+
+_MINER_CMDS = [
+    "--donate-level", "--cpu-priority", "-o stratum+tcp", "stratum+tcp://",
+    "stratum+ssl://", "--algo=", "-a randomx", "-a rx/0", "--coin=monero",
+    "--pool=", "-o pool.", "xmrig -o", "xmrig --url",
+]
+
+
+def check_for_mining(container_id: str) -> dict:
+    inst = _get_container(container_id)
+    if not inst:
+        return {"suspected": False, "confidence": "low", "reasons": ["not found"], "raw": {}}
+
+    weak, raw = [], {}
+
+    try:
+        result = _exec(inst, ["bash", "-c", "ps aux"])
+        ps     = result.stdout or ""
+        raw["ps"] = ps[:2000]
+        for line in ps.lower().splitlines():
+            if any(s in line for s in _SAFE_PROCS):
+                continue
+            for sig in _MINER_SIGS:
+                if sig in line:
+                    weak.append(f"process: '{sig}'")
+    except Exception as e:
+        raw["ps_error"] = str(e)
+
+    try:
+        result    = _exec(inst, ["bash", "-c", "ss -tnp 2>/dev/null || netstat -tnp 2>/dev/null"])
+        conns     = result.stdout or ""
+        raw["conns"] = conns[:2000]
+        for port in _MINER_PORTS:
+            if f":{port}" in conns:
+                weak.append(f"connection on mining port {port}")
+    except Exception as e:
+        raw["conns_error"] = str(e)
+
+    strong = []
+    try:
+        result   = _exec(inst, ["bash", "-c",
+                                 "cat /root/.bash_history 2>/dev/null; "
+                                 "ps -eo args --no-headers 2>/dev/null"])
+        history  = (result.stdout or "").lower()
+        for pattern in _MINER_CMDS:
+            if pattern.lower() in history:
+                strong.append(f"activation command: '{pattern}'")
+    except Exception:
+        pass
+
+    if strong:
+        return {"suspected": True,  "confidence": "high", "reasons": strong, "raw": raw}
+    if len(weak) >= 2:
+        return {"suspected": True,  "confidence": "low",  "reasons": weak,   "raw": raw}
+    return      {"suspected": False, "confidence": "low",  "reasons": weak,   "raw": raw}
+
+
+def handle_high_cpu(container_id: str, threshold: float = 90.0) -> dict:
+    try:
+        stats = get_container_stats(container_id)
+    except Exception:
+        return {"action": "none", "cpu_percent": 0.0}
+
+    if stats["cpu_percent"] < threshold:
+        return {"action": "none", "cpu_percent": stats["cpu_percent"]}
+
+    mining = check_for_mining(container_id)
+    if mining["suspected"] and mining["confidence"] == "high":
+        suspend_vps(container_id)
+        return {
+            "action":         "suspended",
+            "cpu_percent":    stats["cpu_percent"],
+            "confidence":     "high",
+            "reasons":        mining["reasons"],
+        }
+    if mining["suspected"]:
+        return {
+            "action":         "flagged_for_review",
+            "cpu_percent":    stats["cpu_percent"],
+            "confidence":     "low",
+            "reasons":        mining["reasons"],
+        }
+    return {
+        "action":      "none",
+        "cpu_percent": stats["cpu_percent"],
+        "note":        "high CPU, no mining evidence",
+    }
+
+
+# ── file manager ────────────────────────────────────────────────────────────
+
+def list_files(container_id: str, path: str = "/root") -> list[dict]:
+    """Returns a list of file/dir entries at the given path inside the container."""
+    inst = _get_container(container_id)
+    if not inst:
+        raise RuntimeError("Container not found")
+
+    # Use stat for a reliable machine-parseable listing
+    cmd = (
+        f"ls -la --time-style=+%s {path} 2>&1 | tail -n +2"
+    )
+    result = _exec(inst, ["bash", "-c", cmd])
+    lines  = (result.stdout or "").strip().splitlines()
+    entries = []
+    for line in lines:
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            continue
+        perms, _, _, _, size_raw, _, _, _, name = parts
+        if name in (".", ".."):
+            continue
+        is_dir  = perms.startswith("d")
+        is_link = perms.startswith("l")
+        try:
+            size = int(size_raw)
+        except ValueError:
+            size = 0
+        entries.append({
+            "name":    name,
+            "type":    "dir" if is_dir else ("link" if is_link else "file"),
+            "size":    size,
+            "perms":   perms,
+        })
+    return entries
+
+
+def read_file_b64(container_id: str, path: str) -> str:
+    """Returns file contents as a base64 string (safe for JSON transport)."""
+    inst = _get_container(container_id)
+    if not inst:
+        raise RuntimeError("Container not found")
+    result = _exec(inst, ["bash", "-c", f"base64 -w0 {path} 2>&1"])
+    if result.exit_code != 0:
+        raise RuntimeError(result.stdout or "Read failed")
+    return (result.stdout or "").strip()
+
+
+def write_file_b64(container_id: str, path: str, b64_content: str):
+    """Writes base64-encoded content to a file inside the container."""
+    inst = _get_container(container_id)
+    if not inst:
+        raise RuntimeError("Container not found")
+    # Pipe through base64 decode — avoids shell escaping the raw content
+    cmd = f"echo '{b64_content}' | base64 -d > {path}"
+    result = _exec(inst, ["bash", "-c", cmd])
+    if result.exit_code != 0:
+        raise RuntimeError(result.stdout or "Write failed")
+
+
+def delete_file(container_id: str, path: str):
+    """Deletes a file or directory (recursive) inside the container."""
+    inst = _get_container(container_id)
+    if not inst:
+        raise RuntimeError("Container not found")
+    # Refuse to delete root or anything dangerous
+    dangerous = ["/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/proc", "/sys"]
+    if path.rstrip("/") in dangerous:
+        raise RuntimeError("Refusing to delete protected path")
+    result = _exec(inst, ["bash", "-c", f"rm -rf {path}"])
+    if result.exit_code != 0:
+        raise RuntimeError(result.stdout or "Delete failed")
+
+
+def create_directory(container_id: str, path: str):
+    """Creates a directory inside the container."""
+    inst = _get_container(container_id)
+    if not inst:
+        raise RuntimeError("Container not found")
+    result = _exec(inst, ["bash", "-c", f"mkdir -p {path}"])
+    if result.exit_code != 0:
+        raise RuntimeError(result.stdout or "mkdir failed")
+
+
+def exec_command(container_id: str, cmd: str) -> dict:
+    """Runs a one-shot command, returns exit_code + combined output."""
+    inst = _get_container(container_id)
+    if not inst:
+        return {"error": "not found"}
+    result = _exec(inst, ["bash", "-c", cmd])
+    return {
+        "exit_code": result.exit_code,
+        "output":    (result.stdout or "") + (result.stderr or ""),
+    }
+
+
+# ── build log stream ────────────────────────────────────────────────────────
+
+def build_logs_stream(container_id: str):
+    inst = _get_container(container_id)
+    if not inst:
+        yield "Container not found"
+        return
+    try:
+        result = _exec(inst, ["bash", "-c",
+                               "tail -n 100 /var/log/syslog 2>/dev/null || echo 'no logs yet'"])
+        for line in (result.stdout or "").splitlines():
+            yield line
+    except Exception as e:
+        yield f"Could not read logs: {e}"
